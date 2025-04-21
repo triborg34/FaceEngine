@@ -1,3 +1,4 @@
+
 # Import necessary libraries
 from asyncio.log import logger
 import base64
@@ -6,7 +7,6 @@ import time
 import cv2
 import numpy as np
 import threading
-from camera import FreshestFrame
 import queue
 import requests
 from ultralytics import YOLO
@@ -17,8 +17,10 @@ import asyncio
 import websockets
 from threading import Lock
 
+from camera import FreshestFrame
 
-RTSP_URL="rtsp://admin:123456@192.168.1.7:554/stream"
+
+RTSP_URL="rtsp://admin:123456@192.168.1.245:554/stream"
 
 # Environment variables for configuration
 WEBSOCKET_HOST = os.getenv("WEBSOCKET_HOST", "127.0.0.1")  # WebSocket host
@@ -53,7 +55,6 @@ def safe_reshape(embedding, dim=512):
     
     return [embedding[i:i+dim] for i in range(0, len(embedding), dim)]
 
-# Queue to store frames for processing
 # Function to load embeddings from a database
 def load_embeddings_from_db():
     """
@@ -84,20 +85,6 @@ def load_embeddings_from_db():
     except Exception as e:
         print(f"❌ Failed to load embeddings: {e}")
 
-# Function to recognize a face based on its embedding
-def recognize(embedding, threshold=0.6):
-    print(embedding)
-    """
-    Compare the given embedding with known embeddings to recognize a face.
-    """
-    for name, embeddings in known_faces.items():
-        for known_emb in embeddings:
-            sim = cosine_similarity([embedding], [known_emb])[0][0]
-            print(sim)
-            if sim > threshold:
-                return name, sim
-    return "Unknown", 0
-
 # Load known faces at startup
 try:
     load_embeddings_from_db()
@@ -107,11 +94,11 @@ except Exception as e:
 
 # ---- RTSP or webcam ----
 # Initialize video capture (default is webcam)
-cap = cv2.VideoCapture(RTSP_URL) 
+cap = cv2.VideoCapture(RTSP_URL)  # Change to RTSP link if needed
 fresh=FreshestFrame(cap)
 cap.set(cv2.CAP_PROP_FPS, 30)
 
-# ---- Recognition Thread ----
+# ---- Recognition ----
 # Queue to store face crops for recognition
 recognition_queue = queue.Queue()
 # Dictionary to store recognized face names
@@ -127,25 +114,28 @@ def update_face_names(face_id, name):
     with face_names_lock:
         face_names[face_id] = name
 
-# Thread to handle face recognition
-def recognize_thread():
-    """
-    Thread to process face crops and recognize faces.
-    """
-    while True:
-        item = recognition_queue.get()
-        if item is None:
-            break
-        face_id, face_img = item
-        faces = face_embedder.get(face_img)
-        if faces:
-            name, sim = recognize(faces[0].embedding)
-            update_face_names(face_id, f"{name} ({sim:.2f})")
-        else:
-            update_face_names(face_id, "Unknown")
+# Removed threading functionality for recognition
+# Updated recognize function to handle recognition directly without threading
 
-# Start the recognition thread
-threading.Thread(target=recognize_thread, daemon=True).start()
+def recognize(face_crop):
+    """
+    Process a face crop and recognize the face.
+    """
+    faces = face_embedder.get(face_crop)
+    print(faces)
+    if faces:
+        embedding = faces[0].embedding
+        name, sim = "Unknown", 0
+        for known_name, embeddings in known_faces.items():
+            for known_emb in embeddings:
+                sim = cosine_similarity([embedding], [known_emb])[0][0]
+                if sim > 0.6:  # Threshold
+                    name = known_name
+                    break
+            if name != "Unknown":
+                break
+        return f"{name} ({sim:.2f})"
+    return "Unknown"
 
 # ---- Main loop ----
 async def mainLoop(websocket):
@@ -157,14 +147,10 @@ async def mainLoop(websocket):
         start_time = time.time()
         while True:
             try:
-                ret,frame = fresh.read()
+                ret, frame = fresh.read()
                 if not ret or frame is None or frame.size == 0:
-                    logger.info("Producer has stopped. Exiting consumer loop.")
+                    logger.warning("Lost connection or empty frame from RTSP. Reconnecting...")
                     break
-
-                if frame.size == 0:
-                    logger.warning("Skipped empty frame")
-                    continue
 
                 frame_id += 1
                 logger.info(f"Processing frame {frame_id}")
@@ -181,7 +167,7 @@ async def mainLoop(websocket):
                         x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
 
                         # Padding around face
-                        padding = 10
+                        padding = 100
                         h, w, _ = frame.shape
                         x1 = max(0, x1 - padding)
                         y1 = max(0, y1 - padding)
@@ -192,9 +178,9 @@ async def mainLoop(websocket):
                         
 
                         # Only recognize every 25 frames
-                        if frame_id % 60 == 0:
-                            recognition_queue.put((i, face_crop))
-                            cv2.imwrite(f'crops/img{random.randint(0,10000)}.jpg',face_crop)
+                        if frame_id % 25 == 0:
+                            label = recognize(face_crop)
+                            update_face_names(i, label)
 
                         label = face_names.get(i, "Unknown")
 
@@ -232,41 +218,11 @@ async def mainLoop(websocket):
         recognition_queue.put(None)
         if cap.isOpened():
             cap.release()
+            
         cv2.destroyAllWindows()
+        fresh.release()
+        
         logger.info("Resources released and application closed.")
-
-# ---- Frame Producer ----
-def frame_producer(source, buffer, stop_event):
-    """
-    Thread to capture frames from a video source and add them to a buffer.
-    """
-    try:
-        logger.info(f"Connecting to RTSP: {source}")
-        cap = cv2.VideoCapture(source)
-
-        if not cap.isOpened():
-            logger.warning(f"Failed to open {source}. Exiting producer.")
-            return
-
-        while not stop_event.is_set():
-            ret, frame = cap.read()
-            if not ret or frame is None or frame.size == 0:
-                logger.warning(f"Lost connection or empty frame from {source}. Reconnecting...")
-                break
-
-            if buffer.full():
-                buffer.get()  # Drop the oldest frame if the buffer is full
-
-            frame = frame
-            buffer.put(frame)
-
-            del frame
-
-    except Exception as e:
-        logger.error(f"[frame_producer] Error for {source}: {e}")
-    finally:
-        cap.release()
-        logger.info("Frame producer stopped.")
 
 # ---- WebSocket Handler ----
 async def ws_handler(websocket):
@@ -279,19 +235,6 @@ async def ws_handler(websocket):
         logger.info(f"WebSocket connection closed: {e}")
     finally:
         logger.info("WebSocket handler stopped.")
-
-# ---- WebSocket Server ----
-async def websocket_server():
-    """
-    Start the WebSocket server.
-    """
-    logger.info(f"Starting WebSocket server at ws://{WEBSOCKET_HOST}:{WEBSOCKET_PORT}")
-    server = await websockets.serve(
-        ws_handler,
-        WEBSOCKET_HOST,
-        WEBSOCKET_PORT,
-    )
-    await asyncio.Future()
 
 # ---- WebSocket Server ----
 async def websocket_server():
