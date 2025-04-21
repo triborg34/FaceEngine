@@ -6,12 +6,10 @@ import os
 import time
 import cv2
 import numpy as np
-import threading
 import queue
 import requests
 from ultralytics import YOLO
 from insightface.app import FaceAnalysis
-import random
 from sklearn.metrics.pairwise import cosine_similarity
 import asyncio
 import websockets

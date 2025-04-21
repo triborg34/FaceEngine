@@ -11,14 +11,13 @@ import queue
 import requests
 from ultralytics import YOLO
 from insightface.app import FaceAnalysis
-import random
 from sklearn.metrics.pairwise import cosine_similarity
 import asyncio
 import websockets
 from threading import Lock
 
 
-RTSP_URL="rtsp://admin:123456@192.168.1.7:554/stream"
+RTSP_URL="rtsp://admin:123456@192.168.1.245:554/stream"
 
 # Environment variables for configuration
 WEBSOCKET_HOST = os.getenv("WEBSOCKET_HOST", "127.0.0.1")  # WebSocket host
@@ -181,7 +180,7 @@ async def mainLoop(websocket):
                         x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
 
                         # Padding around face
-                        padding = 10
+                        padding = 100
                         h, w, _ = frame.shape
                         x1 = max(0, x1 - padding)
                         y1 = max(0, y1 - padding)
@@ -192,9 +191,9 @@ async def mainLoop(websocket):
                         
 
                         # Only recognize every 25 frames
-                        if frame_id % 60 == 0:
+                        if frame_id % 25 == 0:
                             recognition_queue.put((i, face_crop))
-                            cv2.imwrite(f'crops/img{random.randint(0,10000)}.jpg',face_crop)
+                  
 
                         label = face_names.get(i, "Unknown")
 
