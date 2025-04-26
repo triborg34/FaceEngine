@@ -1,6 +1,7 @@
 import os
 from insightface.app import FaceAnalysis
 import cv2
+import numpy as np
 import requests
 import json
 from ultralytics import YOLO
@@ -115,4 +116,51 @@ def sendToDb(embed, name, img_path):
         print(f"❌ Failed to upload {name}: {response.status_code}")
         print(response.text)
 
-load_known_faces()
+
+def safe_reshape(embedding, dim=512):
+    """
+    Reshape a flat embedding list into a nested list of vectors with the specified dimension.
+    """
+    if isinstance(embedding[0], list) and len(embedding[0]) == dim:
+        return embedding
+    
+    if len(embedding) % dim != 0:
+        raise ValueError(f"Inconsistent embedding length: {len(embedding)} not divisible by {dim}")
+    
+    return [embedding[i:i+dim] for i in range(0, len(embedding), dim)]
+
+
+
+def load_embeddings_from_db():
+    known_names = {}
+    """
+    Load known face embeddings from a database and store them in the `known_faces` dictionary.
+    """
+    url = "http://127.0.0.1:8090/api/collections/known_face/records?perPage=1000"
+
+    try:
+        res = requests.get(url)
+        res.raise_for_status()
+        records = res.json()["items"]
+
+        for item in records:
+            name = item["name"]
+            embedding = item.get("embdanings")
+            if embedding:
+                embedding = embedding[:len(embedding) - (len(embedding) % 512)]
+                try:
+                    reshaped = safe_reshape(embedding)
+                    for emb in reshaped:
+                        emb_array = np.array(emb, dtype=np.float32)
+                        known_names.setdefault(name, []).append(emb_array)
+                except Exception as reshape_error:
+                    print(f"⚠️ Error reshaping embedding for {name}: {reshape_error}")
+        
+        print(f"✅ Loaded {sum(len(v) for v in known_names.values())} embeddings from {len(known_names)} persons")
+        return known_names
+
+    except Exception as e:
+        print(f"❌ Failed to load embeddings: {e}")
+
+if __name__ == "__main__":
+    load_known_faces()
