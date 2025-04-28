@@ -31,7 +31,7 @@ RTSP_URL = "rtsp://admin:123456@192.168.1.245:554/stream"
 # Environment variables for configuration
 WEBSOCKET_HOST = os.getenv("WEBSOCKET_HOST", "127.0.0.1")  # WebSocket host
 WEBSOCKET_PORT = int(os.getenv("WEBSOCKET_PORT", 5000))    # WebSocket port
-MODEL_PATH = os.getenv("MODEL_PATH", "./yolov8n.pt")  # Path to YOLO model
+MODEL_PATH = os.getenv("MODEL_PATH", "models/yolov8n.pt")  # Path to YOLO model
 
 # Load known face embeddings
 known_names = {
@@ -50,7 +50,7 @@ face_info_lock = threading.Lock()
 
 
 #
-model = YOLO(MODEL_PATH, verbose=False)
+model = YOLO(MODEL_PATH, verbose=True)
 cap = cv2.VideoCapture(RTSP_URL)
 freshest = FreshestFrame(cap)
 assert cap.isOpened()

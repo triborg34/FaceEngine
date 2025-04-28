@@ -8,7 +8,7 @@ from ultralytics import YOLO
 
 face_embedder = FaceAnalysis(name='buffalo_l', root='./', providers=['CPUExecutionProvider'])
 face_embedder.prepare(ctx_id=0)
-model=YOLO('yolov8n-face.pt')
+model=YOLO('models/yolov8n.pt')
 
 
 known_faces = {}
@@ -26,21 +26,13 @@ def load_known_faces(db_folder='dbimage'):
                     
                     
                     x1, y1, x2, y2 = map(int, frame.boxes.xyxy[0][:4])
-                    padding = 100
-                    h, w, _ = img.shape
-                    x1 = max(0, x1 - padding)
-                    y1 = max(0, y1 - padding)
-                    x2 = min(w, x2 + padding)
-                    y2 = min(h, y2 + padding)
+
 
                     img = img[y1:y2, x1:x2]
-                    cv2.imshow("face", img)
-                    cv2.waitKey(0)
                         
                 if img is None:
                     continue
                 faces = face_embedder.get(img)
-                print(faces)
                 if faces:
                     embed = faces[0].embedding
                     # Check if the person already exists
