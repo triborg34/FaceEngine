@@ -24,7 +24,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 logging.getLogger('ultralytics').setLevel(logging.ERROR)
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-frps = 5 if device == 'cuda' else 25
+# frps = 5 if device == 'cuda' else 25
 
 face_handler = FaceAnalysis('buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
 face_handler.prepare(ctx_id=0)
@@ -34,6 +34,9 @@ WEBSOCKET_HOST = os.getenv("WEBSOCKET_HOST", "127.0.0.1")
 WEBSOCKET_PORT = int(os.getenv("WEBSOCKET_PORT", 5000))
 MODEL_PATH = os.getenv("MODEL_PATH", "models/yolov8n.pt")
 
+
+track_last_seen = {}
+RECOGNITION_REFRESH_INTERVAL = 1  # seconds
 # Load known embeddings
 try:
     known_names = load_embeddings_from_db()
@@ -70,7 +73,7 @@ def recognize_face(embedding):
             if sim > best_score:
                 best_score = sim
                 best_match = name
-    if best_score > 0.6:
+    if best_score >= 0.6:
         print(best_score)
         return best_match, best_score
     else:
@@ -86,8 +89,8 @@ def recognition_worker():
         track_id, face_img = item
 
         # Optional caching: skip if recently updated
-        # if track_id in face_info and time.time() - face_info[track_id]['last_update'] < 5:
-        #     continue
+        if track_id in face_info and time.time() - face_info[track_id]['last_update'] < 2:
+            continue
 
         faces = face_handler.get(face_img)
         if faces:
@@ -135,8 +138,16 @@ async def main(websocket):
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
                     # Only recognize every frps frames
-                    if counter % frps == 0:
-                        recognition_queue.put((track_id, human_crop))
+                    current_time = time.time()
+                    last_seen = track_last_seen.get(track_id, 0)
+                    if (current_time - last_seen > RECOGNITION_REFRESH_INTERVAL) or (track_id not in track_last_seen):
+                        try:
+                            recognition_queue.put((track_id, human_crop))
+                            track_last_seen[track_id] = current_time
+                        except Exception as e:
+                            logger.error(f"Queue error: {e}")
+                            continue
+                        
 
                     info = face_info.get(track_id, {'name': "Unknown", 'bbox': None})
                     label = f"{info['name']} ID:{track_id}"

@@ -70,7 +70,7 @@ def recognize_face(embedding):
             if sim > best_score:
                 best_score = sim
                 best_match = name
-    if best_score > 0.6:
+    if best_score >= 0.6:
         print(best_score)
         return best_match, best_score
     else:
@@ -86,8 +86,8 @@ def recognition_worker():
         track_id, face_img = item
 
         # Optional caching: skip if recently updated
-        # if track_id in face_info and time.time() - face_info[track_id]['last_update'] < 5:
-        #     continue
+        if track_id in face_info and time.time() - face_info[track_id]['last_update'] < 2:
+            continue
 
         faces = face_handler.get(face_img)
         if faces:
