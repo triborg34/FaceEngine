@@ -5,3 +5,6 @@ dbimage/
 Pocketbase/
 models/
 *.pt
+
+outputs/
+rtest.py

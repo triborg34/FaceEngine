@@ -14,7 +14,7 @@ import websockets
 import torch
 from concurrent.futures import ThreadPoolExecutor
 from camera import FreshestFrame
-from savatoDb import load_embeddings_from_db
+from savatoDb import load_embeddings_from_db,insertToDb
 
 # --- Basic Setup ---
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +48,7 @@ embedding_cache = {}  # Optional cache {track_id: embedding}
 
 model = YOLO(MODEL_PATH, verbose=False)
 cap = cv2.VideoCapture(RTSP_URL)
+
 freshest = FreshestFrame(cap)
 assert cap.isOpened()
 
@@ -56,9 +57,9 @@ executor = ThreadPoolExecutor(max_workers=4)  # Recognition threads
 
 # --- Functions ---
 
-def update_face_info(track_id, name, bbox=None):
+def update_face_info(track_id, name, score,bbox=None):
     with face_info_lock:
-        face_info[track_id] = {'name': name, 'bbox': bbox, 'last_update': time.time()}
+        face_info[track_id] = {'name': name, 'bbox': bbox, 'last_update': time.time(),'score':score}
 
 
 def recognize_face(embedding):
@@ -71,7 +72,7 @@ def recognize_face(embedding):
                 best_score = sim
                 best_match = name
     if best_score >= 0.6:
-        print(best_score)
+       
         return best_match, best_score
     else:
         return "unknown", best_score
@@ -94,7 +95,7 @@ def recognition_worker():
             face = faces[0]
             name, sim = recognize_face(face.embedding)
             x1, y1, x2, y2 = map(int, face.bbox)
-            update_face_info(track_id, name, (x1, y1, x2, y2))
+            update_face_info(track_id, name, sim,(x1, y1, x2, y2))
             embedding_cache[track_id] = face.embedding
         else:
             update_face_info(track_id, "Unknown", None)
@@ -138,15 +139,27 @@ async def main(websocket):
                     if counter % frps == 0:
                         recognition_queue.put((track_id, human_crop))
 
-                    info = face_info.get(track_id, {'name': "Unknown", 'bbox': None})
+                    info = face_info.get(track_id, {'name': "Unknown", "score":0,'bbox': None})
                     label = f"{info['name']} ID:{track_id}"
                     face_bbox = info['bbox']
+                    try:
+                        score=int(info['score']*100)
+                    except TypeError :
+                        score=0
+                    name=info['name']
 
                     if face_bbox:
                         fx1, fy1, fx2, fy2 = face_bbox
                         cv2.rectangle(frame, (x1 + fx1, y1 + fy1), (x1 + fx2, y1 + fy2), (0, 0, 255), 2)
                         cv2.putText(frame, label, (x1, y1 - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                        try:
+                           await insertToDb(name,frame,human_crop,score,track_id)
+                        except Exception as e:
+                            print(e)
+                            continue
+                        
+                        
                     else:
                         cv2.putText(frame, label, (x1, y1 - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
@@ -158,6 +171,9 @@ async def main(websocket):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
             # WebSocket sending
+            cv2.imshow('frame',frame)
+            if cv2.waitKey(1)==ord('q'):
+                break
             _, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
             data = base64.b64encode(encoded).decode('utf-8')
             await websocket.send(data)
