@@ -176,7 +176,7 @@ def load_embeddings_from_db():
                         f" Error reshaping embedding for {name}: {reshape_error}")
 
         logging.info(
-            f"✅ Loaded {sum(len(v) for v in known_names.values())} embeddings from {len(known_names)} persons")
+            f"Loaded {sum(len(v) for v in known_names.values())} embeddings from {len(known_names)} persons")
         return known_names
 
     except Exception as e:

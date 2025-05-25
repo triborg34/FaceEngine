@@ -5,3 +5,6 @@
 [2025-05-25 10:06:37,195] [INFO] Model Load.
 [2025-05-25 10:09:49,077] [INFO] Recognition thread started.
 [2025-05-25 10:09:51,859] [INFO] Model Load.
+[2025-05-25 10:10:30,663] [INFO] ✅ Loaded 1 embeddings from 1 persons
+[2025-05-25 10:10:30,665] [INFO] Recognition thread started.
+[2025-05-25 10:10:32,217] [INFO] Model Load.
