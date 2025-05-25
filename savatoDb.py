@@ -8,7 +8,20 @@ import requests
 import json
 from ultralytics import YOLO
 from PIL import Image
+import logging
 
+
+
+logging.basicConfig(
+    level=logging.DEBUG,  # Capture everything from DEBUG and above
+
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("log.txt", mode='a',
+                            encoding='utf-8'),  # Append mode
+        logging.StreamHandler()  # Optional: also show logs in console
+    ]
+)
 
 def load_known_faces(db_folder='dbimage'):
     face_embedder = FaceAnalysis('buffalo_l', providers=[
@@ -54,7 +67,7 @@ def check_person_exists(name):
         records = response.json()
         return len(records['items']) > 0  # If we found any matching record
     else:
-        print(f"❌ Failed to check existence of {name}: {response.status_code}")
+        logging.info(f" Failed to check existence of {name}: {response.status_code}")
         return False
 
 
@@ -85,16 +98,16 @@ def update_embeddings(embed, name, img_path):
                     update_url, data=data, files=files)
 
                 if update_response.status_code == 200:
-                    print(f"✅ Updated: {name}")
+                    logging.info(f" Updated: {name}")
                 else:
-                    print(
-                        f"❌ Failed to update {name}: {update_response.status_code}")
-                    print(update_response.text)
+                    logging.info(
+                        f" Failed to update {name}: {update_response.status_code}")
+                    logging.info(update_response.text)
         else:
-            print(f"❌ No matching record found to update for {name}")
+            logging.info(f" No matching record found to update for {name}")
     else:
-        print(
-            f"❌ Failed to fetch record for updating {name}: {response.status_code}")
+        logging.info(
+            f" Failed to fetch record for updating {name}: {response.status_code}")
 
 
 def sendToDb(embed, name, img_path):
@@ -116,10 +129,10 @@ def sendToDb(embed, name, img_path):
         response = requests.post(url, data=data, files=files)
 
         if response.status_code == 200:
-            print(f"✅ Uploaded: {name}")
+            logging.info(f"✅ Uploaded: {name}")
         else:
-            print(f"❌ Failed to upload {name}: {response.status_code}")
-            print(response.text)
+            logging.info(f"❌ Failed to upload {name}: {response.status_code}")
+            logging.info(response.text)
 
 
 def safe_reshape(embedding, dim=512):
@@ -159,15 +172,15 @@ def load_embeddings_from_db():
                         emb_array = np.array(emb, dtype=np.float32)
                         known_names.setdefault(name, []).append(emb_array)
                 except Exception as reshape_error:
-                    print(
-                        f"⚠️ Error reshaping embedding for {name}: {reshape_error}")
+                    logging.error(
+                        f" Error reshaping embedding for {name}: {reshape_error}")
 
-        print(
+        logging.info(
             f"✅ Loaded {sum(len(v) for v in known_names.values())} embeddings from {len(known_names)} persons")
         return known_names
 
     except Exception as e:
-        print(f"❌ Failed to load embeddings: {e}")
+        logging.error(f" Failed to load embeddings: {e}")
 
 
 tempTime = None
@@ -203,7 +216,7 @@ def should_insert(name, track_id):
         if entry['name'] == name:
             diff = now - entry['time']
             if diff.total_seconds() < 10:
-                print(diff.total_seconds())
+                
                 return False  # Found recent same person
     return True
 
