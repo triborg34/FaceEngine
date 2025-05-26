@@ -1,5 +1,6 @@
 import datetime
 import os
+from typing import NamedTuple
 import cv2
 from insightface.app import FaceAnalysis
 import cv2
@@ -9,7 +10,6 @@ import json
 from ultralytics import YOLO
 from PIL import Image
 import logging
-
 
 
 logging.basicConfig(
@@ -22,6 +22,7 @@ logging.basicConfig(
         logging.StreamHandler()  # Optional: also show logs in console
     ]
 )
+
 
 def load_known_faces(db_folder='dbimage'):
     face_embedder = FaceAnalysis('buffalo_l', providers=[
@@ -67,7 +68,8 @@ def check_person_exists(name):
         records = response.json()
         return len(records['items']) > 0  # If we found any matching record
     else:
-        logging.info(f" Failed to check existence of {name}: {response.status_code}")
+        logging.info(
+            f" Failed to check existence of {name}: {response.status_code}")
         return False
 
 
@@ -189,13 +191,16 @@ tempTime = None
 def savePicture(frame, croppedface, name, track_id):
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     frame = Image.fromarray(frame)
+    frame_loc = f'outputs/screenshot/s.{name}_{track_id}.jpg'
     frame.save(
-        f'outputs/screenshot/s.{name}_{track_id}.jpg', "JPEG", quality=10, optimize=True)
+        f'{frame_loc}', "JPEG", quality=100, optimize=True)
     # cropp
     croppedface = cv2.cvtColor(croppedface, cv2.COLOR_BGR2RGB)
     croppedface = Image.fromarray(croppedface)
+    crop_loc = f'outputs/cropped/c.{name}_{track_id}.jpg'
     croppedface.save(
-        f'outputs/cropped/c.{name}_{track_id}.jpg', "JPEG", quality=100, optimize=True)
+        f'{crop_loc}', "JPEG", quality=100, optimize=True)
+    return frame_loc, crop_loc
 
 
 def timediff(current_time):
@@ -204,25 +209,42 @@ def timediff(current_time):
         return True
     return (current_time - tempTime).total_seconds() >= 60
 
+class RecentEntry(NamedTuple):
+    name: str
+    track_id: int
+    time: datetime.datetime
 
-recent_names = []
+recent_names: list[RecentEntry] = []
+TIME_THRESHOLD=10
+
+def clean_old_entries():
+    now = datetime.datetime.now()
+    recent_names[:] = [
+        entry for entry in recent_names
+        if (now - entry.time).total_seconds() < TIME_THRESHOLD
+    ]
+
 
 def should_insert(name, track_id):
-    if name == "unknown":
-        return True
-
     now = datetime.datetime.now()
+    clean_old_entries()
+
     for entry in recent_names:
-        if entry['name'] == name:
-            diff = now - entry['time']
-            if diff.total_seconds() < 10:
-                
-                return False  # Found recent same person
+        if name == "unknown" and entry.name == "unknown":
+            if entry.track_id == track_id:
+                if (now - entry.time).total_seconds() < TIME_THRESHOLD:
+                    return False
+
+        elif entry.name == name:
+            if (now - entry.time).total_seconds() < TIME_THRESHOLD:
+                return False
+
     return True
+
 
 async def insertToDb(name, frame, croppedface, score, track_id):
     global tempTime
-    url = "127.0.0.1:8090/api/collections/collection/records"
+    url = "http://127.0.0.1:8090/api/collections/collection/records"
     timeNow = datetime.datetime.now()
     display_time = timeNow.strftime("%H:%M:%S")
     display_date = timeNow.strftime("%Y-%m-%d")
@@ -234,16 +256,48 @@ async def insertToDb(name, frame, croppedface, score, track_id):
         os.makedirs('outputs/screenshot')
     else:
         pass
-    if should_insert(name,track_id):
-        savePicture(frame,croppedface,name,track_id)
-        recent_names.append({
-        "name": name,
-        "trackId": track_id,
-        "time": datetime.datetime.now()
-         })
-    
+    if should_insert(name, track_id):
+        frame_loc, crop_loc = savePicture(frame, croppedface, name, track_id)
 
+        recent_names.append(RecentEntry(name=name, track_id=track_id, time=datetime.datetime.now()))
+
+        with open(frame_loc, "rb") as file1, open(crop_loc, "rb") as file2:
+            files = {
+                # Change field name if needed
+                "frame": (frame_loc, file1, "image/jpeg"),
+                # Change field name if needed
+                "cropped_frame": (crop_loc, file2, "image/jpeg"),
+            }
+
+            response = requests.post(url, files=files, data={
+                "name": name,
+                "score": score,
+                "track_id": str(track_id)
+            })
+        if response.status_code in [200, 201]:
+
+            logging.info(response.json()['id'])
+        else:
+            logging.error("Error:", response.text)
+
+
+def log_detection(name, track_id):
+    if should_insert(name, track_id):
+        recent_names.append({
+            'name': name,
+            'track_id': track_id,
+            'time': datetime.datetime.now()
+        })
+        print(f"✅ Inserted: {name} (track_id: {track_id})")
+    else:
+        print(f"⛔ Skipped: {name} (track_id: {track_id})")
 
 
 if __name__ == "__main__":
+    # import time
+    # log_detection("unknown", 1)  # Should insert
+    # time.sleep(2)
+    # log_detection("unknown", 1)  # Should skip (too soon)
+    # time.sleep(9)
+    # log_detection("unknown", 1)  # Should insert (past 10 sec)
     load_known_faces()

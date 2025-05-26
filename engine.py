@@ -139,6 +139,7 @@ def recognition_worker():
         faces = face_handler.get(face_img)
         if faces:
             face = faces[0]
+
             name, sim = recognize_face(face.embedding)
             x1, y1, x2, y2 = map(int, face.bbox)
             update_face_info(track_id, name, sim, (x1, y1, x2, y2))
@@ -154,11 +155,10 @@ threading.Thread(target=recognition_worker, daemon=True).start()
 
 # --- Main Loop ---
 
-async def process_frame(frame, path,counter):
-    
+async def process_frame(frame, path, counter):
+
     try:
-        
-        
+
         start_time = time.time()
 
         while True:
@@ -166,7 +166,6 @@ async def process_frame(frame, path,counter):
                 continue
 
             frame = cv2.resize(frame, (640, 640))
-            
 
             results = model.track(
                 frame, classes=[0], tracker="bytetrack.yaml", persist=True, device=device)
@@ -182,7 +181,7 @@ async def process_frame(frame, path,counter):
                     human_crop = frame[y1:y2, x1:x2]
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    
+
                     # Only recognize every frps frames
                     if counter % frps == 0:
                         recognition_queue.put((track_id, human_crop))
@@ -203,8 +202,17 @@ async def process_frame(frame, path,counter):
                                       (x1 + fx2, y1 + fy2), (0, 0, 255), 2)
                         cv2.putText(frame, label, (x1, y1 - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                        heightf, widthf = human_crop.shape[:2]
+                        padding=40
+                        fx1 = max(fx1 - padding, 0)
+                        fy1 = max(fy1 - padding, 0)
+                        fx2 = min(fx2 + padding, widthf)
+                        fy2 = min(fy2 + padding, heightf)
+                        # TODO:FIX THIS , AND lest get ot ui
+                        croppedface = human_crop[fy1:fy2, fx1:fx2]
+
                         try:
-                            await insertToDb(name, frame, human_crop,
+                            await insertToDb(name, frame, croppedface,
                                        score, track_id)
                         except Exception as e:
                             logging.error(f"Error Insert to DB {e}")
