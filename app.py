@@ -1,7 +1,12 @@
+import json
+import logging
+import socket
+import time
 from fastapi import FastAPI,Query,Response,Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response,StreamingResponse
-from engine import generate_frames
+from engine import generate_frames, graceful_shutdown
+
 
 
 app = FastAPI()
@@ -20,6 +25,11 @@ app.add_middleware(
 )
 
 
+
+@app.on_event('shutdown')
+def shutdown_event():
+    graceful_shutdown()
+    logging.info("Application shutdown, resources released")
 
 @app.get("/{camera_id}")
 async def video_feed(camera_id: str,request: Request, source: str = Query(...)):
@@ -51,3 +61,26 @@ async def video_feed(camera_id: str,request: Request, source: str = Query(...)):
     except ValueError:
         return Response(f"Invalid camera ID: {camera_id}. Use format: rt1, rt2, etc.",
                         status_code=400)
+        
+        
+        
+
+def discover_onvif_stream(ip_base="192.168.1"):
+    def event_generator():
+        for i in range(1, 255):
+            ip = f"{ip_base}.{i}"
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.3)
+                result = sock.connect_ex((ip, 80))
+                if result == 0:
+                    yield f"data: {json.dumps({'ip': ip, 'port': 80})}\n\n"
+                sock.close()
+            except:
+                continue
+            time.sleep(0.1)
+    return event_generator()
+
+@app.get("/get-stream")
+def get_camera_stream():
+    return StreamingResponse(discover_onvif_stream(), media_type="text/event-stream")

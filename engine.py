@@ -94,6 +94,7 @@ def graceful_shutdown():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
+    
 
     # Stop observer if running
 
