@@ -65,7 +65,8 @@ async def video_feed(camera_id: str,request: Request, source: str = Query(...)):
         
         
 
-def discover_onvif_stream(ip_base="192.168.1"):
+def discover_onvif_stream():
+    ip_base="192.168.1"
     def event_generator():
         for i in range(1, 255):
             ip = f"{ip_base}.{i}"
@@ -81,6 +82,6 @@ def discover_onvif_stream(ip_base="192.168.1"):
             time.sleep(0.1)
     return event_generator()
 
-@app.get("/get-stream")
+@app.get("/onvif/get-stream")
 def get_camera_stream():
     return StreamingResponse(discover_onvif_stream(), media_type="text/event-stream")
