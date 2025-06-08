@@ -103,10 +103,10 @@ def graceful_shutdown():
     os._exit(0)  # Use os._exit instead of sys.exit for more forceful termination
 
 
-def update_face_info(track_id, name, score, bbox=None):
+def update_face_info(track_id, name, score,gender,age, bbox=None):
     with face_info_lock:
         face_info[track_id] = {'name': name, 'bbox': bbox,
-                               'last_update': time.time(), 'score': score}
+                               'last_update': time.time(), 'score': score,'gender':gender,'age':age}
 
 
 def recognize_face(embedding):
@@ -140,13 +140,15 @@ def recognition_worker():
         faces = face_handler.get(face_img)
         if faces:
             face = faces[0]
-
+            
             name, sim = recognize_face(face.embedding)
             x1, y1, x2, y2 = map(int, face.bbox)
-            update_face_info(track_id, name, sim, (x1, y1, x2, y2))
+            gender='female' if face.gender==0 else 'male'
+            age=face.age
+            update_face_info(track_id, name, sim, gender,age,(x1, y1, x2, y2))
             embedding_cache[track_id] = face.embedding
         else:
-            update_face_info(track_id, "Unknown", None)
+            update_face_info(track_id, "Unknown", 'None','None',None,)
 
 
 # --- Threads ---
@@ -157,7 +159,6 @@ threading.Thread(target=recognition_worker, daemon=True).start()
 # --- Main Loop ---
 
 async def process_frame(frame, path, counter):
-
     try:
 
         start_time = time.time()
@@ -188,15 +189,17 @@ async def process_frame(frame, path, counter):
                         recognition_queue.put((track_id, human_crop))
 
                     info = face_info.get(
-                        track_id, {'name': "Unknown", "score": 0, 'bbox': None})
+                        track_id, {'name': "Unknown", "score": 0, 'bbox': None,'gender':'None',"age":"None"})
                     label = f"{info['name']} ID:{track_id}"
                     face_bbox = info['bbox']
+                    
                     try:
                         score = int(info['score']*100)
                     except TypeError:
                         score = 0
                     name = info['name']
-
+                    gender=info['gender']
+                    age=info['age']
                     if face_bbox:
                         fx1, fy1, fx2, fy2 = face_bbox
                         cv2.rectangle(frame, (x1 + fx1, y1 + fy1),
@@ -214,7 +217,7 @@ async def process_frame(frame, path, counter):
 
                         try:
                             await insertToDb(name, frame, croppedface,
-                                       score, track_id)
+                                       score, track_id,gender,age,path)
                         except Exception as e:
                             logging.error(f"Error Insert to DB {e}")
                             continue

@@ -242,7 +242,7 @@ def should_insert(name, track_id):
     return True
 
 
-async def insertToDb(name, frame, croppedface, score, track_id):
+async def insertToDb(name, frame, croppedface, score, track_id,gender,age,path):
     global tempTime
     url = "http://127.0.0.1:8090/api/collections/collection/records"
     timeNow = datetime.datetime.now()
@@ -272,6 +272,11 @@ async def insertToDb(name, frame, croppedface, score, track_id):
             response = requests.post(url, files=files, data={
                 "name": name,
                 "score": score,
+                'gender':gender,
+                'age':age,
+                'camera':path,
+                'date':display_date,
+                'time':display_time,
                 "track_id": str(track_id)
             })
         if response.status_code in [200, 201]:
