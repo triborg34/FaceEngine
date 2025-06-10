@@ -1,16 +1,18 @@
+import io
 import json
 import logging
+import os
+import shutil
 import socket
 import time
-from fastapi import FastAPI,Query,Response,Request
+from fastapi import FastAPI, File, Query, Response, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response,StreamingResponse
-from engine import generate_frames, graceful_shutdown
-
+from fastapi.responses import Response, StreamingResponse
+from engine import generate_frames, graceful_shutdown,imageSearcher
 
 
 app = FastAPI()
-rtsp=['rtsp://192.168.1.245:554/stream']
+rtsp = ['rtsp://192.168.1.245:554/stream']
 
 origins = ["*"]  # Change this to specific domains in production
 
@@ -25,16 +27,16 @@ app.add_middleware(
 )
 
 
-
 @app.on_event('shutdown')
 def shutdown_event():
     graceful_shutdown()
     logging.info("Application shutdown, resources released")
 
+
 @app.get("/{camera_id}")
-async def video_feed(camera_id: str,request: Request, source: str = Query(...)):
-    if source =='0':
-        source=int(source)
+async def video_feed(camera_id: str, request: Request, source: str = Query(...)):
+    if source == '0':
+        source = int(source)
     """Stream video from a specific camera"""
     if not camera_id.startswith("rt"):
         return Response("Invalid camera ID format. Use rt1, rt2, etc.", status_code=400)
@@ -50,7 +52,7 @@ async def video_feed(camera_id: str,request: Request, source: str = Query(...)):
 
         return StreamingResponse(
 
-            generate_frames(camera_idx,source,request),
+            generate_frames(camera_idx, source, request),
 
 
             media_type="multipart/x-mixed-replace; boundary=frame",
@@ -61,12 +63,11 @@ async def video_feed(camera_id: str,request: Request, source: str = Query(...)):
     except ValueError:
         return Response(f"Invalid camera ID: {camera_id}. Use format: rt1, rt2, etc.",
                         status_code=400)
-        
-        
-        
+
 
 def discover_onvif_stream():
-    ip_base="192.168.1"
+    ip_base = "192.168.1"
+
     def event_generator():
         for i in range(1, 255):
             ip = f"{ip_base}.{i}"
@@ -82,6 +83,23 @@ def discover_onvif_stream():
             time.sleep(0.1)
     return event_generator()
 
+
 @app.get("/onvif/get-stream")
 def get_camera_stream():
     return StreamingResponse(discover_onvif_stream(), media_type="text/event-stream")
+
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    UPLOAD_DIR_VIDEO = "uploads"
+    os.makedirs(UPLOAD_DIR_VIDEO, exist_ok=True)
+    file_location = os.path.join(UPLOAD_DIR_VIDEO, file.filename)
+
+    with open(file_location, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    print(file_location)
+    img_encoded = imageSearcher(file_location)
+    os.remove(file_location)
+    
+    return StreamingResponse(io.BytesIO(img_encoded.tobytes()), media_type="image/jpeg")
+    

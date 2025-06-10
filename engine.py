@@ -288,3 +288,11 @@ async def generate_frames(camera_idx, source, request: Request):
 
     finally:
         realseFreshest(fresh, cap)
+
+
+
+def imageSearcher(filePath):
+    frame=cv2.imread(filePath)
+    _, img_encoded = cv2.imencode(".jpg", frame)
+    return img_encoded
+    
