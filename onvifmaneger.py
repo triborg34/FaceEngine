@@ -63,7 +63,7 @@ def get_rtsp_url(ip, port, username, password):
 
 if __name__ == "__main__":
     # cameras = discover_onvif_devices()
-    rtsp=get_rtsp_url('192.168.1.89',2000,'admin','admin')
+    rtsp=get_rtsp_url('192.168.1.89',2000,'admin','123456')
     print(rtsp)
     # if not cameras:
     #     print("❌ No ONVIF cameras found on the network.")

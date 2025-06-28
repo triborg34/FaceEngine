@@ -5,11 +5,19 @@ import os
 import shutil
 import socket
 import time
+from pydantic import BaseModel
 from fastapi import FastAPI, File, Query, Response, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from engine import generate_frames, graceful_shutdown,imageSearcher
+from onvifmaneger import get_rtsp_url
 
+
+class RtspFields(BaseModel):
+    ip:str
+    port:str
+    username:str
+    password:str
 
 app = FastAPI()
 rtsp = ['rtsp://192.168.1.245:554/stream']
@@ -87,6 +95,16 @@ def discover_onvif_stream():
 @app.get("/onvif/get-stream")
 def get_camera_stream():
     return StreamingResponse(discover_onvif_stream(), media_type="text/event-stream")
+
+
+@app.post('/onvif/get-rtsp')
+async def get_camra_rtsp(request:RtspFields):
+    print(request.ip)
+    request.port=int(request.port)
+    rtspUrl=get_rtsp_url(request.ip,request.port,request.username,request.password)
+    return {'rtsp':rtspUrl}
+    
+    
 
 
 @app.post("/upload")
