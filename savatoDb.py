@@ -22,41 +22,37 @@ logging.basicConfig(
         logging.StreamHandler()  # Optional: also show logs in console
     ]
 )
+face_embedder = FaceAnalysis('buffalo_l', providers=[
+    'CUDAExecutionProvider', 'CPUExecutionProvider'])
+face_embedder.prepare(ctx_id=0)
+model = YOLO('models/yolov8n.pt')
 
 
-def load_known_faces(db_folder='dbimage'):
-    face_embedder = FaceAnalysis('buffalo_l', providers=[
-                                 'CUDAExecutionProvider', 'CPUExecutionProvider'])
-    face_embedder.prepare(ctx_id=0)
-    model = YOLO('models/yolov8n.pt')
-    known_faces = {}
-    for person in os.listdir(db_folder):
-        person_path = os.path.join(db_folder, person)
-        if os.path.isdir(person_path):
-            known_faces[person] = []
-            for img_file in os.listdir(person_path):
-                img_path = os.path.join(person_path, img_file)
-                img = cv2.imread(img_path)
-                frame = model(img, classes=[0])[0]
-                if len(frame) > 0:
+def reciveFromUi(name, age, gender, imagePath):
+    """
+    Receive data from the UI and process it.
+    """
 
-                    x1, y1, x2, y2 = map(int, frame.boxes.xyxy[0][:4])
+    img = cv2.imread(imagePath)
+    frame = model(img, classes=[0])[0]
+    if len(frame.boxes) > 0:
+        x1, y1, x2, y2 = map(int, frame.boxes.xyxy[0][:4])
+        img = img[y1:y2, x1:x2]
+    if img is None:
+        logging.error(f"Image not found at {imagePath}")
+        return
+    face = face_embedder.get(img)
+    if face:
+        embed = face[0].embedding
+        
+        # Check if the person already exists
+        if check_person_exists(name):
+            update_embeddings(embed, name, imagePath)
+        else:
+            sendToDb(embed, name, imagePath)
 
-                    img = img[y1:y2, x1:x2]
 
-                if img is None:
-                    continue
-                cv2.imshow('frame', img)
-                cv2.waitKey(0)
-                faces = face_embedder.get(img)
-                if faces:
-                    embed = faces[0].embedding
-                    # Check if the person already exists
-                    if check_person_exists(person):
-                        # TODO:SAVE CROPPED??
-                        update_embeddings(embed, person, img_path)
-                    else:
-                        sendToDb(embed, person, img_path)
+
 
 
 def check_person_exists(name):
@@ -131,9 +127,9 @@ def sendToDb(embed, name, img_path):
         response = requests.post(url, data=data, files=files)
 
         if response.status_code == 200:
-            logging.info(f"✅ Uploaded: {name}")
+            logging.info(f" Uploaded: {name}")
         else:
-            logging.info(f"❌ Failed to upload {name}: {response.status_code}")
+            logging.info(f" Failed to upload {name}: {response.status_code}")
             logging.info(response.text)
 
 
@@ -209,13 +205,16 @@ def timediff(current_time):
         return True
     return (current_time - tempTime).total_seconds() >= 60
 
+
 class RecentEntry(NamedTuple):
     name: str
     track_id: int
     time: datetime.datetime
 
+
 recent_names: list[RecentEntry] = []
-TIME_THRESHOLD=10
+TIME_THRESHOLD = 10
+
 
 def clean_old_entries():
     now = datetime.datetime.now()
@@ -242,7 +241,7 @@ def should_insert(name, track_id):
     return True
 
 
-async def insertToDb(name, frame, croppedface, score, track_id,gender,age,path):
+async def insertToDb(name, frame, croppedface, score, track_id, gender, age, path):
     global tempTime
     url = "http://127.0.0.1:8090/api/collections/collection/records"
     timeNow = datetime.datetime.now()
@@ -259,7 +258,8 @@ async def insertToDb(name, frame, croppedface, score, track_id,gender,age,path):
     if should_insert(name, track_id):
         frame_loc, crop_loc = savePicture(frame, croppedface, name, track_id)
 
-        recent_names.append(RecentEntry(name=name, track_id=track_id, time=datetime.datetime.now()))
+        recent_names.append(RecentEntry(
+            name=name, track_id=track_id, time=datetime.datetime.now()))
 
         with open(frame_loc, "rb") as file1, open(crop_loc, "rb") as file2:
             files = {
@@ -272,11 +272,11 @@ async def insertToDb(name, frame, croppedface, score, track_id,gender,age,path):
             response = requests.post(url, files=files, data={
                 "name": name,
                 "score": score,
-                'gender':gender,
-                'age':age,
-                'camera':path,
-                'date':display_date,
-                'time':display_time,
+                'gender': gender,
+                'age': age,
+                'camera': path,
+                'date': display_date,
+                'time': display_time,
                 "track_id": str(track_id)
             })
         if response.status_code in [200, 201]:
@@ -299,10 +299,47 @@ def log_detection(name, track_id):
 
 
 if __name__ == "__main__":
+    pass
     # import time
     # log_detection("unknown", 1)  # Should insert
     # time.sleep(2)
     # log_detection("unknown", 1)  # Should skip (too soon)
     # time.sleep(9)
     # log_detection("unknown", 1)  # Should insert (past 10 sec)
-    load_known_faces()
+    # load_known_faces()
+
+
+
+# def load_known_faces(db_folder='dbimage'):
+#     face_embedder = FaceAnalysis('buffalo_l', providers=[
+#                                  'CUDAExecutionProvider', 'CPUExecutionProvider'])
+#     face_embedder.prepare(ctx_id=0)
+#     model = YOLO('models/yolov8n.pt')
+#     known_faces = {}
+#     for person in os.listdir(db_folder):
+#         person_path = os.path.join(db_folder, person)
+#         if os.path.isdir(person_path):
+#             known_faces[person] = []
+#             for img_file in os.listdir(person_path):
+#                 img_path = os.path.join(person_path, img_file)
+#                 img = cv2.imread(img_path)
+#                 frame = model.predict(img, classes=[0])[0]
+#                 if len(frame) > 0:
+
+#                     x1, y1, x2, y2 = map(int, frame.boxes.xyxy[0][:4])
+
+#                     img = img[y1:y2, x1:x2]
+
+#                 if img is None:
+#                     continue
+#                 cv2.imshow('frame', img)
+#                 cv2.waitKey(0)
+#                 faces = face_embedder.get(img)
+#                 if faces:
+#                     embed = faces[0].embedding
+#                     # Check if the person already exists
+#                     if check_person_exists(person):
+#                         # TODO:SAVE CROPPED??
+#                         update_embeddings(embed, person, img_path)
+#                     else:
+#                         sendToDb(embed, person, img_path)

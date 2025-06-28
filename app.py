@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from fastapi import FastAPI, File, Query, Response, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
-from engine import generate_frames, graceful_shutdown,imageSearcher
+from engine import generate_frames, graceful_shutdown,imageSearcher,imageCrop
 from onvifmaneger import get_rtsp_url
 
 
@@ -116,8 +116,17 @@ async def upload_file(file: UploadFile = File(...)):
     with open(file_location, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     print(file_location)
-    img_encoded = imageSearcher(file_location)
-    os.remove(file_location)
+    img_encoded = imageCrop(file_location)
     
-    return StreamingResponse(io.BytesIO(img_encoded.tobytes()), media_type="image/jpeg")
+    # Convert image to base64
+    import base64
+    img_base64 = base64.b64encode(img_encoded.tobytes()).decode('utf-8')
     
+    return {
+        "file_location": file_location,
+        "image_data": img_base64,
+        "media_type": "image/jpeg"
+    }
+    
+
+

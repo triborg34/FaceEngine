@@ -296,3 +296,20 @@ def imageSearcher(filePath):
     _, img_encoded = cv2.imencode(".jpg", frame)
     return img_encoded
     
+def imageCrop(filepath):
+    frame=cv2.imread(filepath)
+    facebox=face_handler.get(frame)[0].bbox
+    x1,y1,x2,y2=map(int,facebox)
+    heightf, widthf = frame.shape[:2]
+    padding=40
+    x1 = max(x1 - padding, 0)
+    y1 = max(y1 - padding, 0)
+    x2 = min(x2 + padding, widthf)
+    y2 = min(y2 + padding, heightf)
+    frame=frame[y1:y2,x1:x2]
+    _, img_encoded = cv2.imencode(".jpg", frame)
+    return img_encoded
+    
+
+if __name__ =="__main__":
+    imageCrop(r'dbimage\aref\image.png')
