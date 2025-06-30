@@ -22,16 +22,16 @@ logging.basicConfig(
         logging.StreamHandler()  # Optional: also show logs in console
     ]
 )
-face_embedder = FaceAnalysis('buffalo_l', providers=[
-    'CUDAExecutionProvider', 'CPUExecutionProvider'])
-face_embedder.prepare(ctx_id=0)
-model = YOLO('models/yolov8n.pt')
 
 
-def reciveFromUi(name, age, gender, imagePath):
+def reciveFromUi(name, imagePath, age, gender, role, socialnumber):
     """
     Receive data from the UI and process it.
     """
+    face_embedder = FaceAnalysis('buffalo_l', providers=[
+        'CUDAExecutionProvider', 'CPUExecutionProvider'])
+    face_embedder.prepare(ctx_id=0)
+    model = YOLO('models/yolov8n.pt')
 
     img = cv2.imread(imagePath)
     frame = model(img, classes=[0])[0]
@@ -44,15 +44,14 @@ def reciveFromUi(name, age, gender, imagePath):
     face = face_embedder.get(img)
     if face:
         embed = face[0].embedding
-        
+
         # Check if the person already exists
         if check_person_exists(name):
-            update_embeddings(embed, name, imagePath)
+            update_embeddings(embed, name, imagePath, age,
+                              gender, role, socialnumber)
         else:
-            sendToDb(embed, name, imagePath)
-
-
-
+            sendToDb(embed, name, imagePath, age, gender,
+                     role, socialnumber)
 
 
 def check_person_exists(name):
@@ -69,7 +68,7 @@ def check_person_exists(name):
         return False
 
 
-def update_embeddings(embed, name, img_path):
+def update_embeddings(embed, name, img_path, age, gender, role, socialnumber):
     url = f"http://127.0.0.1:8090/api/collections/known_face/records?filter=name=%22{name}%22"
 
     response = requests.get(url)
@@ -83,7 +82,11 @@ def update_embeddings(embed, name, img_path):
             # Prepare data to update the record with the latest embedding
             data = {
                 # Store only the latest embedding as a string
-                "embdanings": json.dumps(embed.tolist())
+                "embdanings": json.dumps(embed.tolist()), "name": name,
+                "gender": gender,
+                "age": age,
+                "role": role,
+                 "socialnumber": socialnumber
             }
     #         files = {
     #     "image": open(img_path, "rb")
@@ -101,6 +104,7 @@ def update_embeddings(embed, name, img_path):
                     logging.info(
                         f" Failed to update {name}: {update_response.status_code}")
                     logging.info(update_response.text)
+            os.remove(img_path)
         else:
             logging.info(f" No matching record found to update for {name}")
     else:
@@ -108,7 +112,7 @@ def update_embeddings(embed, name, img_path):
             f" Failed to fetch record for updating {name}: {response.status_code}")
 
 
-def sendToDb(embed, name, img_path):
+def sendToDb(embed, name, img_path,age, gender, role, socialnumber):
     url = "http://127.0.0.1:8090/api/collections/known_face/records"
 
     # Convert embedding (numpy) to list
@@ -118,6 +122,11 @@ def sendToDb(embed, name, img_path):
     data = {
         "name": name,
         "embdanings": embed_list  # Ensure this is a list of embeddings as a string
+        ,"gender": gender,
+        "age": age,
+        "role": role,
+       "socialnumber": socialnumber
+
     }
     # files = {
     #     "image": open(img_path, "rb")
@@ -128,9 +137,11 @@ def sendToDb(embed, name, img_path):
 
         if response.status_code == 200:
             logging.info(f" Uploaded: {name}")
+            
         else:
             logging.info(f" Failed to upload {name}: {response.status_code}")
             logging.info(response.text)
+    os.remove(img_path)
 
 
 def safe_reshape(embedding, dim=512):
@@ -293,9 +304,9 @@ def log_detection(name, track_id):
             'track_id': track_id,
             'time': datetime.datetime.now()
         })
-        print(f"✅ Inserted: {name} (track_id: {track_id})")
+        print(f" Inserted: {name} (track_id: {track_id})")
     else:
-        print(f"⛔ Skipped: {name} (track_id: {track_id})")
+        print(f" Skipped: {name} (track_id: {track_id})")
 
 
 if __name__ == "__main__":
@@ -307,7 +318,6 @@ if __name__ == "__main__":
     # time.sleep(9)
     # log_detection("unknown", 1)  # Should insert (past 10 sec)
     # load_known_faces()
-
 
 
 # def load_known_faces(db_folder='dbimage'):

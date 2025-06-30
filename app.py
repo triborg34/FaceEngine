@@ -11,13 +11,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from engine import generate_frames, graceful_shutdown,imageSearcher,imageCrop
 from onvifmaneger import get_rtsp_url
-
+from savatoDb import reciveFromUi
 
 class RtspFields(BaseModel):
     ip:str
     port:str
     username:str
     password:str
+
+
+class KnownPersonFields(BaseModel):
+    name:str
+    gender:str
+    imagePath:str
+    age:str
+    role:str
+    socialnumber:str
+    
 
 app = FastAPI()
 rtsp = ['rtsp://192.168.1.245:554/stream']
@@ -130,3 +140,13 @@ async def upload_file(file: UploadFile = File(...)):
     
 
 
+
+
+@app.post("/insertKToDp")
+async def insertKtoDp(data:KnownPersonFields):
+    try:
+        reciveFromUi(data.name,data.imagePath,data.age,data.gender,data.role,data.socialnumber)
+        return Response("successful",200)
+    except Exception as e:
+        return Response(e,400)
+    
