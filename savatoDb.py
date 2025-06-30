@@ -1,6 +1,7 @@
 import datetime
 import os
 from typing import NamedTuple
+from urllib.request import urlopen
 import cv2
 from insightface.app import FaceAnalysis
 import cv2
@@ -10,6 +11,8 @@ import json
 from ultralytics import YOLO
 from PIL import Image
 import logging
+
+import urllib.request
 
 
 logging.basicConfig(
@@ -24,7 +27,7 @@ logging.basicConfig(
 )
 
 
-def reciveFromUi(name, imagePath, age, gender, role, socialnumber):
+def reciveFromUi(name, imagePath, age, gender, role, socialnumber, isUrl):
     """
     Receive data from the UI and process it.
     """
@@ -32,6 +35,10 @@ def reciveFromUi(name, imagePath, age, gender, role, socialnumber):
         'CUDAExecutionProvider', 'CPUExecutionProvider'])
     face_embedder.prepare(ctx_id=0)
     model = YOLO('models/yolov8n.pt')
+    if isUrl:
+        path = urllib.request.urlretrieve(
+            imagePath, "uploads/local-filename.jpg")
+        imagePath = path[0]
 
     img = cv2.imread(imagePath)
     frame = model(img, classes=[0])[0]
@@ -44,6 +51,7 @@ def reciveFromUi(name, imagePath, age, gender, role, socialnumber):
     face = face_embedder.get(img)
     if face:
         embed = face[0].embedding
+        print(embed)
 
         # Check if the person already exists
         if check_person_exists(name):
@@ -86,7 +94,7 @@ def update_embeddings(embed, name, img_path, age, gender, role, socialnumber):
                 "gender": gender,
                 "age": age,
                 "role": role,
-                 "socialnumber": socialnumber
+                "socialnumber": socialnumber
             }
     #         files = {
     #     "image": open(img_path, "rb")
@@ -112,7 +120,7 @@ def update_embeddings(embed, name, img_path, age, gender, role, socialnumber):
             f" Failed to fetch record for updating {name}: {response.status_code}")
 
 
-def sendToDb(embed, name, img_path,age, gender, role, socialnumber):
+def sendToDb(embed, name, img_path, age, gender, role, socialnumber):
     url = "http://127.0.0.1:8090/api/collections/known_face/records"
 
     # Convert embedding (numpy) to list
@@ -122,10 +130,10 @@ def sendToDb(embed, name, img_path,age, gender, role, socialnumber):
     data = {
         "name": name,
         "embdanings": embed_list  # Ensure this is a list of embeddings as a string
-        ,"gender": gender,
+        , "gender": gender,
         "age": age,
         "role": role,
-       "socialnumber": socialnumber
+        "socialnumber": socialnumber
 
     }
     # files = {
@@ -137,7 +145,7 @@ def sendToDb(embed, name, img_path,age, gender, role, socialnumber):
 
         if response.status_code == 200:
             logging.info(f" Uploaded: {name}")
-            
+
         else:
             logging.info(f" Failed to upload {name}: {response.status_code}")
             logging.info(response.text)
@@ -162,6 +170,7 @@ def load_embeddings_from_db():
     known_names = {}
     """
     Load known face embeddings from a database and store them in the `known_names` dictionary.
+    Each entry contains name, age, gender, and embeddings.
     """
     url = "http://127.0.0.1:8090/api/collections/known_face/records?perPage=1000"
 
@@ -172,24 +181,45 @@ def load_embeddings_from_db():
 
         for item in records:
             name = item["name"]
+            # Note: typo in original - should be "embeddings"
             embedding = item.get("embdanings")
+            age = item.get('age')
+            gender = item.get('gender')
+
+            print(f"{age=},{gender=}")
+
             if embedding:
                 embedding = embedding[:len(embedding) - (len(embedding) % 512)]
                 try:
                     reshaped = safe_reshape(embedding)
+
+                    # Initialize the person's entry if it doesn't exist
+                    if name not in known_names:
+                        known_names[name] = {
+
+                            'age': age,
+                            'gender': gender,
+                            'embeddings': []
+                        }
+
+                    # Add all embeddings for this person
                     for emb in reshaped:
                         emb_array = np.array(emb, dtype=np.float32)
-                        known_names.setdefault(name, []).append(emb_array)
+                        known_names[name]['embeddings'].append(emb_array)
+
                 except Exception as reshape_error:
                     logging.error(
-                        f" Error reshaping embedding for {name}: {reshape_error}")
-
+                        f"Error reshaping embedding for {name}: {reshape_error}")
+        print(known_names)
+        total_embeddings = sum(len(person['embeddings'])
+                               for person in known_names.values())
         logging.info(
-            f"Loaded {sum(len(v) for v in known_names.values())} embeddings from {len(known_names)} persons")
+            f"Loaded {total_embeddings} embeddings from {len(known_names)} persons")
         return known_names
 
     except Exception as e:
-        logging.error(f" Failed to load embeddings: {e}")
+        logging.error(f"Failed to load embeddings: {e}")
+        return {}
 
 
 tempTime = None

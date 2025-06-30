@@ -94,7 +94,6 @@ def graceful_shutdown():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
-    
 
     # Stop observer if running
 
@@ -103,26 +102,33 @@ def graceful_shutdown():
     os._exit(0)  # Use os._exit instead of sys.exit for more forceful termination
 
 
-def update_face_info(track_id, name, score,gender,age, bbox=None):
+def update_face_info(track_id, name, score, gender, age, bbox=None):
     with face_info_lock:
         face_info[track_id] = {'name': name, 'bbox': bbox,
-                               'last_update': time.time(), 'score': score,'gender':gender,'age':age}
+                               'last_update': time.time(), 'score': score, 'gender': gender, 'age': age}
 
 
-def recognize_face(embedding):
+def recognize_face(embedding, fgender, fage):
     best_match = 'unknown'
     best_score = 0.0
-    for name, embeds in known_names.items():
+    best_age = fage  # Default to detected age
+    best_gender = fgender  # Default to detected gender
+    for name, person_data in known_names.items():
+        age = person_data['age']
+        gender = person_data['gender']
+        embeds = person_data['embeddings']
         for known_emb in embeds:
             sim = cosine_similarity([embedding], [known_emb])[0][0]
             if sim > best_score:
                 best_score = sim
                 best_match = name
+                best_age = age  # Store the known age
+                best_gender = gender  # Store the known gender
     if best_score >= 0.6:
 
-        return best_match, best_score
+        return best_match, best_score, best_gender, best_age
     else:
-        return "unknown", best_score
+        return "unknown", best_score, fgender, fage
 
 
 def recognition_worker():
@@ -140,15 +146,17 @@ def recognition_worker():
         faces = face_handler.get(face_img)
         if faces:
             face = faces[0]
-            
-            name, sim = recognize_face(face.embedding)
+            gender = 'female' if face.gender == 0 else 'male'
+            age = face.age
+            name, sim, gender, age = recognize_face(
+                face.embedding, gender, age)
             x1, y1, x2, y2 = map(int, face.bbox)
-            gender='female' if face.gender==0 else 'male'
-            age=face.age
-            update_face_info(track_id, name, sim, gender,age,(x1, y1, x2, y2))
+
+            update_face_info(track_id, name, sim, gender,
+                             age, (x1, y1, x2, y2))
             embedding_cache[track_id] = face.embedding
         else:
-            update_face_info(track_id, "Unknown", 'None','None',None,)
+            update_face_info(track_id, "Unknown", 'None', 'None', None,)
 
 
 # --- Threads ---
@@ -189,17 +197,17 @@ async def process_frame(frame, path, counter):
                         recognition_queue.put((track_id, human_crop))
 
                     info = face_info.get(
-                        track_id, {'name': "Unknown", "score": 0, 'bbox': None,'gender':'None',"age":"None"})
+                        track_id, {'name': "Unknown", "score": 0, 'bbox': None, 'gender': 'None', "age": "None"})
                     label = f"{info['name']} ID:{track_id}"
                     face_bbox = info['bbox']
-                    
+
                     try:
                         score = int(info['score']*100)
                     except TypeError:
                         score = 0
                     name = info['name']
-                    gender=info['gender']
-                    age=info['age']
+                    gender = info['gender']
+                    age = info['age']
                     if face_bbox:
                         fx1, fy1, fx2, fy2 = face_bbox
                         cv2.rectangle(frame, (x1 + fx1, y1 + fy1),
@@ -207,7 +215,7 @@ async def process_frame(frame, path, counter):
                         cv2.putText(frame, label, (x1, y1 - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                         heightf, widthf = human_crop.shape[:2]
-                        padding=40
+                        padding = 40
                         fx1 = max(fx1 - padding, 0)
                         fy1 = max(fy1 - padding, 0)
                         fx2 = min(fx2 + padding, widthf)
@@ -216,8 +224,8 @@ async def process_frame(frame, path, counter):
                         croppedface = human_crop[fy1:fy2, fx1:fx2]
 
                         try:
-                            await insertToDb(name, frame, croppedface,
-                                       score, track_id,gender,age,path)
+                            await insertToDb(name, frame, croppedface,  # 3 pic (croppedface,croppedhuman,frame)
+                                             score, track_id, gender, age, path)
                         except Exception as e:
                             logging.error(f"Error Insert to DB {e}")
                             continue
@@ -267,7 +275,7 @@ async def generate_frames(camera_idx, source, request: Request):
                 logging.info("Client disconnected, releasing camera.")
                 break
             success, frame = fresh.read()
-            height,width=frame.shape[0],frame.shape[1]
+            height, width = frame.shape[0], frame.shape[1]
             if not success:
 
                 # Generate blank frame if we can't read from camera
@@ -276,9 +284,9 @@ async def generate_frames(camera_idx, source, request: Request):
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             else:
 
-                frame =await process_frame(frame, f'/rt{camera_idx}',success)
-            
-            frame=cv2.resize(frame,(width,height))
+                frame = await process_frame(frame, f'/rt{camera_idx}', success)
+
+            frame = cv2.resize(frame, (width, height))
 
             # Encode and yield the frame
             _, buffer = cv2.imencode('.jpg', frame)
@@ -290,26 +298,26 @@ async def generate_frames(camera_idx, source, request: Request):
         realseFreshest(fresh, cap)
 
 
-
 def imageSearcher(filePath):
-    frame=cv2.imread(filePath)
+    frame = cv2.imread(filePath)
     _, img_encoded = cv2.imencode(".jpg", frame)
     return img_encoded
-    
+
+
 def imageCrop(filepath):
-    frame=cv2.imread(filepath)
-    facebox=face_handler.get(frame)[0].bbox
-    x1,y1,x2,y2=map(int,facebox)
+    frame = cv2.imread(filepath)
+    facebox = face_handler.get(frame)[0].bbox
+    x1, y1, x2, y2 = map(int, facebox)
     heightf, widthf = frame.shape[:2]
-    padding=40
+    padding = 40
     x1 = max(x1 - padding, 0)
     y1 = max(y1 - padding, 0)
     x2 = min(x2 + padding, widthf)
     y2 = min(y2 + padding, heightf)
-    frame=frame[y1:y2,x1:x2]
+    frame = frame[y1:y2, x1:x2]
     _, img_encoded = cv2.imencode(".jpg", frame)
     return img_encoded
-    
 
-if __name__ =="__main__":
+
+if __name__ == "__main__":
     imageCrop(r'dbimage\aref\image.png')

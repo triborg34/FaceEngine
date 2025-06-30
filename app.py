@@ -144,8 +144,13 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.post("/insertKToDp")
 async def insertKtoDp(data:KnownPersonFields):
+    if(data.imagePath.startswith('http://')):
+        isurl=True
+    else:
+        isurl=False
+
     try:
-        reciveFromUi(data.name,data.imagePath,data.age,data.gender,data.role,data.socialnumber)
+        reciveFromUi(data.name,data.imagePath,data.age,data.gender,data.role,data.socialnumber,isurl)
         return Response("successful",200)
     except Exception as e:
         return Response(e,400)

@@ -1,9 +1,8 @@
-from ultralytics import solutions
 
-app = solutions.SearchApp(
-    
-    # data = "path/to/img/directory" # Optional, build search engine with your own images
-    device="cpu"  # configure the device for processing i.e "cpu" or "cuda"
-)
+import cv2
+import urllib.request
 
-app.run(debug=False)  # You can also use `debug=True` argument for testing
+import numpy as np
+d =urllib.request.urlretrieve('http://127.0.0.1:8090/api/files/collection/xd1mivsg192584q/s4zmi7yhrex_99mlpz1l83.unknown_1.jpg', "uploads/local-filename.jpg")
+
+print(d[0])
