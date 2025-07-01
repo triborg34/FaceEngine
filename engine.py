@@ -160,7 +160,7 @@ def recognition_worker():
                              age, role,(x1, y1, x2, y2))
             embedding_cache[track_id] = face.embedding
         else:
-            update_face_info(track_id, "Unknown", 'None', 'None',role, None,)
+            update_face_info(track_id, "Unknown", 'None', 'None','', None,)
 
 
 # --- Threads ---
