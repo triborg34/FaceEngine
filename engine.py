@@ -157,10 +157,10 @@ def recognition_worker():
             x1, y1, x2, y2 = map(int, face.bbox)
 
             update_face_info(track_id, name, sim, gender,
-                             age, (x1, y1, x2, y2))
+                             age, role,(x1, y1, x2, y2))
             embedding_cache[track_id] = face.embedding
         else:
-            update_face_info(track_id, "Unknown", 'None', 'None', None,)
+            update_face_info(track_id, "Unknown", 'None', 'None',role, None,)
 
 
 # --- Threads ---
@@ -229,7 +229,7 @@ async def process_frame(frame, path, counter):
                         croppedface = human_crop[fy1:fy2, fx1:fx2]
 
                         try:
-                            await insertToDb(name, frame, croppedface,  # 3 pic (croppedface,croppedhuman,frame) send role to db
+                            await insertToDb(name, frame, croppedface,human_crop,  # 3 pic (croppedface,croppedhuman,frame) send role to db
                                              score, track_id, gender, age,role, path)
                         except Exception as e:
                             logging.error(f"Error Insert to DB {e}")

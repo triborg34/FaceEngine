@@ -185,7 +185,7 @@ def load_embeddings_from_db():
             embedding = item.get("embdanings")
             age = item.get('age')
             gender = item.get('gender')
-            role=item.get('role')
+            role = item.get('role')
 
             print(f"{age=},{gender=}")
 
@@ -200,7 +200,7 @@ def load_embeddings_from_db():
 
                             'age': age,
                             'gender': gender,
-                            'role':role,
+                            'role': role,
                             'embeddings': []
                         }
 
@@ -227,7 +227,7 @@ def load_embeddings_from_db():
 tempTime = None
 
 
-def savePicture(frame, croppedface, name, track_id):
+def savePicture(frame, croppedface, humancrop, name, track_id):
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     frame = Image.fromarray(frame)
     frame_loc = f'outputs/screenshot/s.{name}_{track_id}.jpg'
@@ -239,7 +239,13 @@ def savePicture(frame, croppedface, name, track_id):
     crop_loc = f'outputs/cropped/c.{name}_{track_id}.jpg'
     croppedface.save(
         f'{crop_loc}', "JPEG", quality=100, optimize=True)
-    return frame_loc, crop_loc
+    humancrop = cv2.cvtColor(croppedface, cv2.COLOR_BGR2RGB)
+    humancrop = Image.fromarray(croppedface)
+    human_loc = f'outputs/cropped/c.{name}_{track_id}.jpg'
+    humancrop.save(
+        f'{human_loc}', "JPEG", quality=100, optimize=True)
+
+    return frame_loc, crop_loc, human_loc
 
 
 def timediff(current_time):
@@ -284,7 +290,7 @@ def should_insert(name, track_id):
     return True
 
 
-async def insertToDb(name, frame, croppedface, score, track_id, gender, age,role, path):
+async def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender, age, role, path):
     global tempTime
     url = "http://127.0.0.1:8090/api/collections/collection/records"
     timeNow = datetime.datetime.now()
@@ -296,20 +302,23 @@ async def insertToDb(name, frame, croppedface, score, track_id, gender, age,role
         os.makedirs('outputs')
         os.makedirs('outputs/cropped')
         os.makedirs('outputs/screenshot')
+        os.makedirs('outputs/humancrop')
     else:
         pass
     if should_insert(name, track_id):
-        frame_loc, crop_loc = savePicture(frame, croppedface, name, track_id)
+        frame_loc, crop_loc, human_loc = savePicture(
+            frame, croppedface, humancrop, name, track_id)
 
         recent_names.append(RecentEntry(
             name=name, track_id=track_id, time=datetime.datetime.now()))
 
-        with open(frame_loc, "rb") as file1, open(crop_loc, "rb") as file2:
+        with open(frame_loc, "rb") as file1, open(crop_loc, "rb") as file2,open(human_loc,'rb') as file3:
             files = {
                 # Change field name if needed
                 "frame": (frame_loc, file1, "image/jpeg"),
                 # Change field name if needed
                 "cropped_frame": (crop_loc, file2, "image/jpeg"),
+                "humancrop":(human_loc,file3,"image/jpeg")
             }
 
             response = requests.post(url, files=files, data={
@@ -320,7 +329,7 @@ async def insertToDb(name, frame, croppedface, score, track_id, gender, age,role
                 'camera': path,
                 'date': display_date,
                 'time': display_time,
-                'role':role,
+                'role': role,
                 "track_id": str(track_id)
             })
         if response.status_code in [200, 201]:
