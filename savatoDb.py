@@ -185,6 +185,7 @@ def load_embeddings_from_db():
             embedding = item.get("embdanings")
             age = item.get('age')
             gender = item.get('gender')
+            role=item.get('role')
 
             print(f"{age=},{gender=}")
 
@@ -199,6 +200,7 @@ def load_embeddings_from_db():
 
                             'age': age,
                             'gender': gender,
+                            'role':role,
                             'embeddings': []
                         }
 
@@ -210,7 +212,7 @@ def load_embeddings_from_db():
                 except Exception as reshape_error:
                     logging.error(
                         f"Error reshaping embedding for {name}: {reshape_error}")
-        print(known_names)
+
         total_embeddings = sum(len(person['embeddings'])
                                for person in known_names.values())
         logging.info(
@@ -282,7 +284,7 @@ def should_insert(name, track_id):
     return True
 
 
-async def insertToDb(name, frame, croppedface, score, track_id, gender, age, path):
+async def insertToDb(name, frame, croppedface, score, track_id, gender, age,role, path):
     global tempTime
     url = "http://127.0.0.1:8090/api/collections/collection/records"
     timeNow = datetime.datetime.now()
@@ -318,6 +320,7 @@ async def insertToDb(name, frame, croppedface, score, track_id, gender, age, pat
                 'camera': path,
                 'date': display_date,
                 'time': display_time,
+                'role':role,
                 "track_id": str(track_id)
             })
         if response.status_code in [200, 201]:

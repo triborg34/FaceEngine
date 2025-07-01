@@ -102,10 +102,10 @@ def graceful_shutdown():
     os._exit(0)  # Use os._exit instead of sys.exit for more forceful termination
 
 
-def update_face_info(track_id, name, score, gender, age, bbox=None):
+def update_face_info(track_id, name, score, gender, age,role, bbox=None):
     with face_info_lock:
         face_info[track_id] = {'name': name, 'bbox': bbox,
-                               'last_update': time.time(), 'score': score, 'gender': gender, 'age': age}
+                               'last_update': time.time(), 'score': score, 'gender': gender, 'age': age,'role':role}
 
 
 def recognize_face(embedding, fgender, fage):
@@ -113,9 +113,11 @@ def recognize_face(embedding, fgender, fage):
     best_score = 0.0
     best_age = fage  # Default to detected age
     best_gender = fgender  # Default to detected gender
+    best_role=''
     for name, person_data in known_names.items():
         age = person_data['age']
         gender = person_data['gender']
+        role=person_data['role']
         embeds = person_data['embeddings']
         for known_emb in embeds:
             sim = cosine_similarity([embedding], [known_emb])[0][0]
@@ -124,11 +126,12 @@ def recognize_face(embedding, fgender, fage):
                 best_match = name
                 best_age = age  # Store the known age
                 best_gender = gender  # Store the known gender
+                best_role=role
     if best_score >= 0.6:
 
-        return best_match, best_score, best_gender, best_age
+        return best_match, best_score, best_gender, best_age,best_role
     else:
-        return "unknown", best_score, fgender, fage
+        return "unknown", best_score, fgender, fage,best_role
 
 
 def recognition_worker():
@@ -148,7 +151,8 @@ def recognition_worker():
             face = faces[0]
             gender = 'female' if face.gender == 0 else 'male'
             age = face.age
-            name, sim, gender, age = recognize_face(
+            
+            name, sim, gender, age,role = recognize_face(
                 face.embedding, gender, age)
             x1, y1, x2, y2 = map(int, face.bbox)
 
@@ -208,6 +212,7 @@ async def process_frame(frame, path, counter):
                     name = info['name']
                     gender = info['gender']
                     age = info['age']
+                    role=info['role']
                     if face_bbox:
                         fx1, fy1, fx2, fy2 = face_bbox
                         cv2.rectangle(frame, (x1 + fx1, y1 + fy1),
@@ -224,8 +229,8 @@ async def process_frame(frame, path, counter):
                         croppedface = human_crop[fy1:fy2, fx1:fx2]
 
                         try:
-                            await insertToDb(name, frame, croppedface,  # 3 pic (croppedface,croppedhuman,frame)
-                                             score, track_id, gender, age, path)
+                            await insertToDb(name, frame, croppedface,  # 3 pic (croppedface,croppedhuman,frame) send role to db
+                                             score, track_id, gender, age,role, path)
                         except Exception as e:
                             logging.error(f"Error Insert to DB {e}")
                             continue
