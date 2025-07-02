@@ -13,7 +13,7 @@ model=YOLO('models/yolov8n.pt')
 frame=cv2.imread(r'C:\Users\Microsoft\Downloads\aref.jpg')
 frame=cv2.resize(frame,(640,640))
 
-resuilt=model.predict(frame)[0]
+resuilt=model.predict(frame,classes=[0])[0]
 
 x1,y1,x2,y2=map(int,resuilt.boxes.xyxy[0][:4])
 

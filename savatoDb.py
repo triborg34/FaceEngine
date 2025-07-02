@@ -239,9 +239,9 @@ def savePicture(frame, croppedface, humancrop, name, track_id):
     crop_loc = f'outputs/cropped/c.{name}_{track_id}.jpg'
     croppedface.save(
         f'{crop_loc}', "JPEG", quality=100, optimize=True)
-    humancrop = cv2.cvtColor(croppedface, cv2.COLOR_BGR2RGB)
-    humancrop = Image.fromarray(croppedface)
-    human_loc = f'outputs/cropped/c.{name}_{track_id}.jpg'
+    humancrop = cv2.cvtColor(humancrop, cv2.COLOR_BGR2RGB)
+    humancrop = Image.fromarray(humancrop)
+    human_loc = f'outputs/humancrop/c.{name}_{track_id}.jpg'
     humancrop.save(
         f'{human_loc}', "JPEG", quality=100, optimize=True)
 

@@ -135,6 +135,7 @@ def recognize_face(embedding, fgender, fage):
 
 
 def recognition_worker():
+    
     logging.info("Recognition thread started.")
     while True:
         item = recognition_queue.get()
@@ -147,6 +148,7 @@ def recognition_worker():
             continue
 
         faces = face_handler.get(face_img)
+        
         if faces:
             face = faces[0]
             gender = 'female' if face.gender == 0 else 'male'
