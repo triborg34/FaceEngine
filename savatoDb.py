@@ -31,8 +31,8 @@ def reciveFromUi(name, imagePath, age, gender, role, socialnumber, isUrl):
     """
     Receive data from the UI and process it.
     """
-    face_embedder = FaceAnalysis('buffalo_l', providers=[
-        'CUDAExecutionProvider', 'CPUExecutionProvider'])
+    face_embedder = FaceAnalysis('antelopev2', providers=[
+        'CUDAExecutionProvider', 'CPUExecutionProvider'],root='.')
     face_embedder.prepare(ctx_id=0)
     model = YOLO('models/yolov8n.pt')
     if isUrl:
@@ -63,7 +63,7 @@ def reciveFromUi(name, imagePath, age, gender, role, socialnumber, isUrl):
 
 
 def check_person_exists(name):
-    url = f"http://127.0.0.1:8090/api/collections/known_face/records?filter=name=%22{name}%22"
+    url = f"http://127.0.0.1:8091/api/collections/known_face/records?filter=name=%22{name}%22"
 
     response = requests.get(url)
 
@@ -77,7 +77,7 @@ def check_person_exists(name):
 
 
 def update_embeddings(embed, name, img_path, age, gender, role, socialnumber):
-    url = f"http://127.0.0.1:8090/api/collections/known_face/records?filter=name=%22{name}%22"
+    url = f"http://127.0.0.1:8091/api/collections/known_face/records?filter=name=%22{name}%22"
 
     response = requests.get(url)
 
@@ -102,7 +102,7 @@ def update_embeddings(embed, name, img_path, age, gender, role, socialnumber):
             with open(img_path, 'rb') as file:
                 files = {"image": file}
               # Update the record with the new embedding
-                update_url = f"http://127.0.0.1:8090/api/collections/known_face/records/{record_id}"
+                update_url = f"http://127.0.0.1:8091/api/collections/known_face/records/{record_id}"
                 update_response = requests.patch(
                     update_url, data=data, files=files)
 
@@ -121,7 +121,7 @@ def update_embeddings(embed, name, img_path, age, gender, role, socialnumber):
 
 
 def sendToDb(embed, name, img_path, age, gender, role, socialnumber):
-    url = "http://127.0.0.1:8090/api/collections/known_face/records"
+    url = "http://127.0.0.1:8091/api/collections/known_face/records"
 
     # Convert embedding (numpy) to list
     embed_list = embed.tolist()
@@ -172,7 +172,7 @@ def load_embeddings_from_db():
     Load known face embeddings from a database and store them in the `known_names` dictionary.
     Each entry contains name, age, gender, and embeddings.
     """
-    url = "http://127.0.0.1:8090/api/collections/known_face/records?perPage=1000"
+    url = "http://127.0.0.1:8091/api/collections/known_face/records?perPage=1000"
 
     try:
         res = requests.get(url)
@@ -292,7 +292,7 @@ def should_insert(name, track_id):
 
 async def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender, age, role, path):
     global tempTime
-    url = "http://127.0.0.1:8090/api/collections/collection/records"
+    url = "http://127.0.0.1:8091/api/collections/collection/records"
     timeNow = datetime.datetime.now()
     display_time = timeNow.strftime("%H:%M:%S")
     display_date = timeNow.strftime("%Y-%m-%d")

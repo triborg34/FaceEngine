@@ -5,11 +5,14 @@ import os
 import shutil
 import socket
 import time
+import webbrowser
+from fastapi.concurrency import asynccontextmanager
 from pydantic import BaseModel
 from fastapi import FastAPI, File, Query, Response, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
-from engine import generate_frames, graceful_shutdown,imageSearcher,imageCrop
+import uvicorn
+from engine import generate_frames, graceful_shutdown,imageSearcher,imageCrop, loadConfig, loadDb, loadModel
 from onvifmaneger import get_rtsp_url
 from savatoDb import reciveFromUi
 
@@ -30,7 +33,7 @@ class KnownPersonFields(BaseModel):
     
 
 app = FastAPI()
-rtsp = ['rtsp://192.168.1.245:554/stream']
+
 
 origins = ["*"]  # Change this to specific domains in production
 
@@ -45,8 +48,9 @@ app.add_middleware(
 )
 
 
-@app.on_event('shutdown')
-def shutdown_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
     graceful_shutdown()
     logging.info("Application shutdown, resources released")
 
@@ -64,9 +68,6 @@ async def video_feed(camera_id: str, request: Request, source: str = Query(...))
         camera_idx = int(camera_id[2:])
 
         # Check if camera index is valid
-        if camera_idx < 1 or camera_idx > len(rtsp):
-            return Response(f"Camera {camera_id} not found. Valid range: rt1-rt{len(rtsp)}",
-                            status_code=404)
 
         return StreamingResponse(
 
@@ -155,3 +156,18 @@ async def insertKtoDp(data:KnownPersonFields):
     except Exception as e:
         return Response(e,400)
     
+    
+    
+
+if __name__ == "__main__":
+    loadDb()
+    host = '0.0.0.0'
+    # port = int(loadConfig())
+    port=8000
+
+    loader = loadModel()
+    if (loader):
+
+        # webbrowser.open(f'http://127.0.0.1:{port}/web/app')
+        uvicorn.run("app:app", log_level='info',log_config=None,
+                    reload=False)
