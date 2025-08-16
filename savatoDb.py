@@ -30,7 +30,7 @@ logging.basicConfig(
 def reciveFromUi(name, imagePath, age, gender, role, socialnumber, isUrl):
     """
     Receive data from the UI and process it.
-    """
+    """ 
     face_embedder = FaceAnalysis('antelopev2', providers=[
         'CUDAExecutionProvider', 'CPUExecutionProvider'],root='.')
     face_embedder.prepare(ctx_id=0)
@@ -320,7 +320,7 @@ async def insertToDb(name, frame, croppedface, humancrop, score, track_id, gende
                 "cropped_frame": (crop_loc, file2, "image/jpeg"),
                 "humancrop":(human_loc,file3,"image/jpeg")
             }
-
+            
             response = requests.post(url, files=files, data={
                 "name": name,
                 "score": score,
@@ -330,7 +330,8 @@ async def insertToDb(name, frame, croppedface, humancrop, score, track_id, gende
                 'date': display_date,
                 'time': display_time,
                 'role': role,
-                "track_id": str(track_id)
+                "track_id": str(track_id),
+                'filename':human_loc.split('/')[2]
             })
         if response.status_code in [200, 201]:
 
