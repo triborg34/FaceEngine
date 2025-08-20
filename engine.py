@@ -170,7 +170,7 @@ class CCtvMonitor:
             logging.error(f"Failed to load database: {e}")
             return {}
 
-    def release_resources(self, fresh: FreshestFrame, cap: cv2.VideoCapture):
+    def release_resources(self, fresh: FreshestFrame, cap: cv2.VideoCapture,role:bool):
         """Properly release camera resources"""
         try:
             if fresh:
@@ -178,7 +178,8 @@ class CCtvMonitor:
             if cap:
                 cap.release()
             # Signal recognition worker to stop
-            self.recognition_queue.put(None)
+            if not role:
+                self.recognition_queue.put(None)
         except Exception as e:
             logging.error(f"Error releasing camera resources: {e}")
 
@@ -312,12 +313,12 @@ class CCtvMonitor:
         # self.precompute_embeddings(
         #         self.load_image_searcher_model(), self.FOLDER_PATH)
         """Start the recognition worker thread"""
-        recognition_thread = threading.Thread(
-            target=self.recognition_worker,
-            daemon=True
-        )
-        recognition_thread.start()
-        return recognition_thread
+        # recognition_thread = threading.Thread(
+        #     target=self.recognition_worker,
+        #     daemon=True
+        # )
+        # recognition_thread.start()
+        # return recognition_thread
 
     async def process_frame(self, frame, path, counter):
         """Process a single frame for object detection and face recognition"""
@@ -558,7 +559,7 @@ class CCtvMonitor:
         except Exception as e:
             logging.error(f"Error in generate_frames: {e}")
         finally:
-            self.release_resources(fresh, cap)
+            self.release_resources(fresh, cap,role)
 
 
 def image_searcher(file_path):

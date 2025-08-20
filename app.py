@@ -113,20 +113,15 @@ async def video_feed(camera_id: str, request: Request, source: str = Query(...),
         camera_idx = int(camera_id[2:])
         
         logging.info(f"Starting video stream for camera {camera_idx} with source: {source}")
-        if role==True:
-            multiprocessing.Process(
-                target=cctv_monitor.recognition_worker,
-                daemon=True
-            ).terminate()
-        else:
+        if not role:
             
-            if multiprocessing.Process(
+            if threading.Thread(
                 target=cctv_monitor.recognition_worker,
                 daemon=True
             ).is_alive():
                 pass
             else:
-                multiprocessing.Process(
+                threading.Thread(
                 target=cctv_monitor.recognition_worker,
                 daemon=True
             ).start()
