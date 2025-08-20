@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import socket
+import threading
 import time
 import webbrowser
 import base64
@@ -92,7 +93,7 @@ async def health_check():
     }
 
 @app.get("/{camera_id}")
-async def video_feed(camera_id: str, request: Request, source: str = Query(...)):
+async def video_feed(camera_id: str, request: Request, source: str = Query(...), role :bool = Query()):
     """Stream video from a specific camera"""
     if not cctv_monitor:
         raise HTTPException(status_code=503, detail="CCTV Monitor not initialized")
@@ -112,9 +113,29 @@ async def video_feed(camera_id: str, request: Request, source: str = Query(...))
         camera_idx = int(camera_id[2:])
         
         logging.info(f"Starting video stream for camera {camera_idx} with source: {source}")
+        if role==True:
+            multiprocessing.Process(
+                target=cctv_monitor.recognition_worker,
+                daemon=True
+            ).terminate()
+        else:
+            
+            if multiprocessing.Process(
+                target=cctv_monitor.recognition_worker,
+                daemon=True
+            ).is_alive():
+                pass
+            else:
+                multiprocessing.Process(
+                target=cctv_monitor.recognition_worker,
+                daemon=True
+            ).start()
+            
+                
+        
 
         return StreamingResponse(
-            cctv_monitor.generate_frames(camera_idx, source, request),
+            cctv_monitor.generate_frames(camera_idx, source, request,role),
             media_type="multipart/x-mixed-replace; boundary=frame",
             headers={
                 "Cache-Control": "no-store",

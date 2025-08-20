@@ -92,7 +92,7 @@ class CCtvMonitor:
         return model
 
     def get_embedding(self, img_path):
-        model=self.load_image_searcher_model()
+        model = self.load_image_searcher_model()
         img = Image.open(img_path).convert("RGB")
         img_t = self.transform(img).unsqueeze(0).to(self.device)
         with torch.no_grad():
@@ -108,7 +108,7 @@ class CCtvMonitor:
             if not fname.lower().endswith(self.IMG_EXTENSIONS):
                 continue
             fpath = os.path.join(folder_path, fname)
-            emb = self.get_embedding( fpath)
+            emb = self.get_embedding(fpath)
             embeddings.append(emb)
             filenames.append(fname)
             print(f"Processed {fname}")
@@ -122,7 +122,7 @@ class CCtvMonitor:
 
     def load_embeddings(self):
         embeddings = np.load(self.EMBEDDING_FILE)
-        with open(self.FILENAMES_FILE, "r",encoding='utf-8') as f:
+        with open(self.FILENAMES_FILE, "r", encoding='utf-8') as f:
             filenames = f.read().splitlines()
         print(f"Loaded {len(filenames)} embeddings from disk")
         return embeddings, filenames
@@ -311,7 +311,6 @@ class CCtvMonitor:
         # if not os.path.exists(self.EMBEDDING_FILE) or not os.path.exists(self.FILENAMES_FILE):
         # self.precompute_embeddings(
         #         self.load_image_searcher_model(), self.FOLDER_PATH)
-
         """Start the recognition worker thread"""
         recognition_thread = threading.Thread(
             target=self.recognition_worker,
@@ -330,7 +329,7 @@ class CCtvMonitor:
 
             # Resize frame for processing
             # processed_frame = cv2.resize(frame, (640, 640))
-            processed_frame=frame
+            processed_frame = frame
 
             # Run YOLO detection
             results = self.model.track(
@@ -360,8 +359,8 @@ class CCtvMonitor:
                                   (x2, y2), (0, 255, 0), 2)
 
                     # Queue for recognition every frps frames
-                    if counter % self.frps == 0:
-                        self.recognition_queue.put((track_id, human_crop))
+                    # if counter % self.frps == 0:
+                    self.recognition_queue.put((track_id, human_crop))
 
                     # Get face info
                     with self.face_info_lock:
@@ -464,7 +463,7 @@ class CCtvMonitor:
             logging.warning(f"Connection check failed: {e}")
             return False
 
-    async def generate_frames(self, camera_idx, source, request: Request):
+    async def generate_frames(self, camera_idx, source, request: Request,role:bool):
         """Generate frames from a specific camera feed"""
         if not self.is_connection_alive(source):
             logging.warning(f"[Camera {camera_idx}] Connection not available")
@@ -536,7 +535,11 @@ class CCtvMonitor:
                     original_height, original_width = frame.shape[:2]
 
                     # Process frame
-                    frame = await self.process_frame(frame, f'/rt{camera_idx}', counter)
+                    if role == True:
+                        frame=frame
+                    else:
+
+                        frame = await self.process_frame(frame, f'/rt{camera_idx}', counter)
 
                     # Resize back to original dimensions
                     frame = cv2.resize(
@@ -571,7 +574,7 @@ def image_searcher(file_path):
         return None
 
 
-def image_crop(filepath,isSearch):
+def image_crop(filepath, isSearch):
     """Crop face from image with padding"""
     if isSearch:
         frame = cv2.imread(filepath)
@@ -609,18 +612,17 @@ def image_crop(filepath,isSearch):
 
     except Exception as e:
         logging.error(f"Error in image_crop: {e}")
-        return None 
+        return None
 
 
 if __name__ == "__main__":
     a = CCtvMonitor()
     embeddings, filenames = a.load_embeddings()
 
-    query_path='outputs/screenshot/s.unknown_29.jpg'
-    query_embedding = a.get_embedding( query_path)
-    results = a.find_similar_images(query_embedding, embeddings, filenames, top_k=10)
+    query_path = 'outputs/screenshot/s.unknown_29.jpg'
+    query_embedding = a.get_embedding(query_path)
+    results = a.find_similar_images(
+        query_embedding, embeddings, filenames, top_k=10)
     print("\nTop similar images:")
     for fname, score in results:
         print(f"{fname}: {score:.4f}")
-    
-    
