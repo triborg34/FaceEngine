@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logging.info("Shutting down CCTV Monitor application...")
     if cctv_monitor:
-        cctv_monitor.graceful_shutdown()
+        await cctv_monitor.graceful_shutdown()
     logging.info("Application shutdown complete")
 
 # Create FastAPI app with lifespan manager
@@ -125,6 +125,7 @@ async def video_feed(camera_id: str, request: Request, source: str = Query(...),
                 target=cctv_monitor.recognition_worker,
                 daemon=True
             ).start()
+                await cctv_monitor.start_background_processing()
             
                 
         

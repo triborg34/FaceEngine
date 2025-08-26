@@ -1,6 +1,6 @@
 import asyncio
+from asyncio import Queue
 import gc
-import io
 import logging
 import multiprocessing
 import os
@@ -58,6 +58,13 @@ class CCtvMonitor:
 
         # Load database
         self.known_names = self.load_db()
+        self.db_queue = Queue(maxsize=1000)  # Limit queue size
+        self.db_task = None
+        self.stats = {
+            'processed': 0,
+            'queued': 0,
+            'failed': 0
+        }
 
         # Threading and process management
         self.process = None
@@ -101,7 +108,7 @@ class CCtvMonitor:
         return features / np.linalg.norm(features)
 
     def precompute_embeddings(self, model, folder_path):
-        print("Precomputing embeddings for all images in folder...")
+        logging.info("Precomputing embeddings for all images in folder...")
         embeddings = []
         filenames = []
         for fname in os.listdir(folder_path):
@@ -111,7 +118,7 @@ class CCtvMonitor:
             emb = self.get_embedding(fpath)
             embeddings.append(emb)
             filenames.append(fname)
-            print(f"Processed {fname}")
+            logging.info(f"Processed {fname}")
         embeddings = np.array(embeddings)
         np.save(self.EMBEDDING_FILE, embeddings)
         with open(self.FILENAMES_FILE, "w", encoding="utf-8") as f:
@@ -124,7 +131,7 @@ class CCtvMonitor:
         embeddings = np.load(self.EMBEDDING_FILE)
         with open(self.FILENAMES_FILE, "r", encoding='utf-8') as f:
             filenames = f.read().splitlines()
-        print(f"Loaded {len(filenames)} embeddings from disk")
+        logging.info(f"Loaded {len(filenames)} embeddings from disk")
         return embeddings, filenames
 
     def find_similar_images(self, query_embedding, embeddings, filenames, top_k=10):
@@ -170,7 +177,7 @@ class CCtvMonitor:
             logging.error(f"Failed to load database: {e}")
             return {}
 
-    def release_resources(self, fresh: FreshestFrame, cap: cv2.VideoCapture,role:bool):
+    async def release_resources(self, fresh: FreshestFrame, cap: cv2.VideoCapture, role: bool):
         """Properly release camera resources"""
         try:
             if fresh:
@@ -180,10 +187,11 @@ class CCtvMonitor:
             # Signal recognition worker to stop
             if not role:
                 self.recognition_queue.put(None)
+                await self.stop_background_processing()
         except Exception as e:
             logging.error(f"Error releasing camera resources: {e}")
 
-    def graceful_shutdown(self):
+    async def graceful_shutdown(self):
         """Gracefully shutdown the system"""
         logging.info("Initiating graceful shutdown...")
 
@@ -208,7 +216,7 @@ class CCtvMonitor:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.process.kill()
-
+        await self.stop_background_processing()
         logging.info("Cleanup complete.")
 
     def update_face_info(self, track_id, name, score, gender, age, role, bbox=None):
@@ -223,6 +231,93 @@ class CCtvMonitor:
                 'age': age,
                 'role': role
             }
+
+    async def start_background_processing(self):
+        """Start the background database processing task"""
+        logging.info("Start the background database processing task")
+        self.db_task = asyncio.create_task(self._process_db_queue())
+
+    async def stop_background_processing(self):
+        """Gracefully stop background processing"""
+        logging.info("Gracefully stop background processing")
+        if self.db_task:
+            self.db_task.cancel()
+            try:
+                await self.db_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _process_db_queue(self):
+        """Background task to process database insertions"""
+        while True:
+            try:
+                # Get item from queue (blocks if empty)
+                data = await self.db_queue.get()
+
+                try:
+                    await insertToDb(
+                        data['name'],
+                        data['frame'],
+                        data['face'],
+                        data['human_crop'],
+                        data['score'],
+                        data['track_id'],
+                        data['gender'],
+                        data['age'],
+                        data['role'],
+                        data['path']
+                    )
+                    self.stats['processed'] += 1
+
+                except Exception as e:
+                    logging.error(f"Error inserting to DB: {e}")
+                    self.stats['failed'] += 1
+
+                finally:
+                    # Mark task as done
+                    self.db_queue.task_done()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"Unexpected error in DB queue processor: {e}")
+                await asyncio.sleep(1)  # Prevent tight error loops
+
+    async def queue_db_insertion(self, name, frame, face, human_crop,
+                                 score, track_id, gender, age, role, path):
+        """Queue a database insertion (non-blocking)"""
+        try:
+            # Create a copy of image data to avoid reference issues
+            data = {
+                'name': name,
+                'frame': frame.copy(),  # Important: copy arrays
+                'face': face.copy(),
+                'human_crop': human_crop.copy(),
+                'score': score,
+                'track_id': track_id,
+                'gender': gender,
+                'age': age,
+                'role': role,
+                'path': path
+            }
+
+            # Try to add to queue (non-blocking)
+            self.db_queue.put_nowait(data)
+            self.stats['queued'] += 1
+
+        except asyncio.QueueFull:
+            logging.warning("Database queue is full, dropping frame data")
+            # Optionally: implement a strategy like dropping oldest items
+        except Exception as e:
+            logging.error(f"Error queuing DB insertion: {e}")
+
+    def get_queue_stats(self):
+        """Get current queue statistics"""
+        return {
+            **self.stats,
+            'queue_size': self.db_queue.qsize(),
+            'queue_full': self.db_queue.full()
+        }
 
     def recognize_face(self, embedding, fgender, fage):
         """Recognize face using embedding comparison"""
@@ -360,8 +455,10 @@ class CCtvMonitor:
                                   (x2, y2), (0, 255, 0), 2)
 
                     # Queue for recognition every frps frames
-                    # if counter % self.frps == 0:
-                    self.recognition_queue.put((track_id, human_crop))
+                    if counter % self.frps == 0:
+                      stats=self.get_queue_stats()
+                      logging.info(f"Queue: {stats['queue_size']}, Processed: {stats['processed']}, Failed: {stats['failed']}")
+                      self.recognition_queue.put((track_id, human_crop))
 
                     # Get face info
                     with self.face_info_lock:
@@ -419,7 +516,7 @@ class CCtvMonitor:
 
                         # Insert to database
                         try:
-                            await insertToDb(
+                            await self.queue_db_insertion(
                                 name, processed_frame, cropped_face, human_crop,
                                 score, track_id, gender, age, role, path
                             )
@@ -464,7 +561,7 @@ class CCtvMonitor:
             logging.warning(f"Connection check failed: {e}")
             return False
 
-    async def generate_frames(self, camera_idx, source, request: Request,role:bool):
+    async def generate_frames(self, camera_idx, source, request: Request, role: bool):
         """Generate frames from a specific camera feed"""
         if not self.is_connection_alive(source):
             logging.warning(f"[Camera {camera_idx}] Connection not available")
@@ -537,7 +634,7 @@ class CCtvMonitor:
 
                     # Process frame
                     if role == True:
-                        frame=frame
+                        frame = frame
                     else:
 
                         frame = await self.process_frame(frame, f'/rt{camera_idx}', counter)
@@ -559,7 +656,7 @@ class CCtvMonitor:
         except Exception as e:
             logging.error(f"Error in generate_frames: {e}")
         finally:
-            self.release_resources(fresh, cap,role)
+            await self.release_resources(fresh, cap, role)
 
 
 def image_searcher(file_path):
