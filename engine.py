@@ -406,7 +406,7 @@ class CCtvMonitor:
                                                     fx1_padded:fx2_padded]
 
                     try:
-                        insertToDb(name,frame.copy(),cropped_face.copy(),face_img.copy(),sim,track_id,gender,age,role,path) #TODO
+                        insertToDb(name,frame.copy(),cropped_face.copy(),face_img.copy(),det_score,track_id,gender,age,role,path) #TODO
                     except Exception as e:
                                 logging.error(f"Error inserting to DB: {e}")
                 
