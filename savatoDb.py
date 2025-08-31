@@ -290,7 +290,7 @@ def should_insert(name, track_id):
     return True
 
 
-async def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender, age, role, path):
+def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender, age, role, path):
     global tempTime
     url = "http://127.0.0.1:8091/api/collections/collection/records"
     timeNow = datetime.datetime.now()

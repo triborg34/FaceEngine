@@ -361,12 +361,10 @@ class CCtvMonitor:
             try:
                 # Use timeout to allow checking shutdown event
                 item = self.recognition_queue.get(timeout=1.0)
-
                 if item is None:
                     break
 
-                track_id, face_img = item
-
+                frame,path,track_id, face_img = item
                 # Skip if recently updated (performance optimization)
                 with self.face_info_lock:
                     if (track_id in self.face_info and
@@ -380,7 +378,7 @@ class CCtvMonitor:
                     face = faces[0]
                     gender = 'female' if face.gender == 0 else 'male'
                     age = face.age
-
+                    det_score = float(face.det_score)
                     name, sim, gender, age, role = self.recognize_face(
                         face.embedding, gender, age
                     )
@@ -395,6 +393,24 @@ class CCtvMonitor:
                     self.update_face_info(
                         track_id, "Unknown", 0.0, 'None', 'None', '', None
                     )
+
+                if det_score>=0.8:
+                    height_f, width_f = face_img.shape[:2]
+                    padding = 40
+                    fx1_padded = max(x1 - padding, 0)
+                    fy1_padded = max(y1 - padding, 0)
+                    fx2_padded = min(x2 + padding, width_f)
+                    fy2_padded = min(y2 + padding, height_f)
+
+                    cropped_face = face_img[fy1_padded:fy2_padded,
+                                                    fx1_padded:fx2_padded]
+
+                    try:
+                        insertToDb(name,frame.copy(),cropped_face.copy(),face_img.copy(),sim,track_id,gender,age,role,path) #TODO
+                    except Exception as e:
+                                logging.error(f"Error inserting to DB: {e}")
+                
+                    
 
             except queue.Empty:
                 continue  # Timeout, check shutdown event
@@ -455,10 +471,10 @@ class CCtvMonitor:
                                   (x2, y2), (0, 255, 0), 2)
 
                     # Queue for recognition every frps frames
-                    if counter % self.frps == 0:
-                      stats=self.get_queue_stats()
-                      logging.info(f"Queue: {stats['queue_size']}, Processed: {stats['processed']}, Failed: {stats['failed']}")
-                      self.recognition_queue.put((track_id, human_crop))
+                    # if counter % self.frps == 0:
+                    #   stats=self.get_queue_stats()
+                    #   logging.info(f"Queue: {stats['queue_size']}, Processed: {stats['processed']}, Failed: {stats['failed']}")
+                    self.recognition_queue.put((processed_frame.copy(),path,track_id, human_crop))
 
                     # Get face info
                     with self.face_info_lock:
@@ -478,16 +494,16 @@ class CCtvMonitor:
                     label = f"{info['name']} ID:{track_id}"
                     face_bbox = info['bbox']
 
-                    try:
-                        score = int(info['score'] *
-                                    100) if info['score'] else 0
-                    except (TypeError, ValueError):
-                        score = 0
+                    # try:
+                    #     score = int(info['score'] *
+                    #                 100) if info['score'] else 0
+                    # except (TypeError, ValueError):
+                    #     score = 0
 
-                    name = info['name']
-                    gender = info['gender']
-                    age = info['age']
-                    role = info['role']
+                    # name = info['name']
+                    # gender = info['gender']
+                    # age = info['age']
+                    # role = info['role']
 
                     # Draw face bounding box if available
                     if face_bbox:
@@ -504,24 +520,24 @@ class CCtvMonitor:
                         )
 
                         # Crop face with padding
-                        height_f, width_f = human_crop.shape[:2]
-                        padding = 40
-                        fx1_padded = max(fx1 - padding, 0)
-                        fy1_padded = max(fy1 - padding, 0)
-                        fx2_padded = min(fx2 + padding, width_f)
-                        fy2_padded = min(fy2 + padding, height_f)
+                        # height_f, width_f = human_crop.shape[:2]
+                        # padding = 40
+                        # fx1_padded = max(fx1 - padding, 0)
+                        # fy1_padded = max(fy1 - padding, 0)
+                        # fx2_padded = min(fx2 + padding, width_f)
+                        # fy2_padded = min(fy2 + padding, height_f)
 
-                        cropped_face = human_crop[fy1_padded:fy2_padded,
-                                                  fx1_padded:fx2_padded]
+                        # cropped_face = human_crop[fy1_padded:fy2_padded,
+                        #                           fx1_padded:fx2_padded]
 
-                        # Insert to database
-                        try:
-                            await self.queue_db_insertion(
-                                name, processed_frame, cropped_face, human_crop,
-                                score, track_id, gender, age, role, path
-                            )
-                        except Exception as e:
-                            logging.error(f"Error inserting to DB: {e}")
+                        # # Insert to database
+                        # try:
+                        #     await self.queue_db_insertion(
+                        #         name, processed_frame, cropped_face, human_crop,
+                        #         score, track_id, gender, age, role, path
+                        #     )
+                        # except Exception as e:
+                        #     logging.error(f"Error inserting to DB: {e}")
 
                     else:
                         cv2.putText(
@@ -714,13 +730,16 @@ def image_crop(filepath, isSearch):
 
 
 if __name__ == "__main__":
-    a = CCtvMonitor()
-    embeddings, filenames = a.load_embeddings()
+    a=CCtvMonitor()
+    a.recognition_worker()
+    a.generate_frames('/rt1','rtsp://192.168.1.10:554/stream',Request,False)
+    # a = CCtvMonitor()
+    # embeddings, filenames = a.load_embeddings()
 
-    query_path = 'outputs/screenshot/s.unknown_29.jpg'
-    query_embedding = a.get_embedding(query_path)
-    results = a.find_similar_images(
-        query_embedding, embeddings, filenames, top_k=10)
-    print("\nTop similar images:")
-    for fname, score in results:
-        print(f"{fname}: {score:.4f}")
+    # query_path = 'outputs/screenshot/s.unknown_29.jpg'
+    # query_embedding = a.get_embedding(query_path)
+    # results = a.find_similar_images(
+    #     query_embedding, embeddings, filenames, top_k=10)
+    # print("\nTop similar images:")
+    # for fname, score in results:
+    #     print(f"{fname}: {score:.4f}")
