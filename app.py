@@ -153,7 +153,7 @@ def discover_onvif_stream():
     ip_base = "192.168.1"
 
     def event_generator():
-        yield f"data: {json.dumps({'status': 'scanning', 'message': 'Starting network scan...'})}\n\n"
+        # yield f"data: {json.dumps({'status': 'scanning', 'message': 'Starting network scan...'})}\n\n"
         
         found_devices = 0
         for i in range(1, 255):
@@ -171,13 +171,13 @@ def discover_onvif_stream():
                 continue
             
             # Send progress updates
-            if i % 50 == 0:
-                progress = (i / 254) * 100
-                yield f"data: {json.dumps({'status': 'progress', 'progress': progress, 'found': found_devices})}\n\n"
+            # if i % 50 == 0:
+            #     progress = (i / 254) * 100
+            #     yield f"data: {json.dumps({'status': 'progress', 'progress': progress, 'found': found_devices})}\n\n"
             
             time.sleep(0.1)
         
-        yield f"data: {json.dumps({'status': 'complete', 'total_found': found_devices})}\n\n"
+        # yield f"data: {json.dumps({'status': 'complete', 'total_found': found_devices})}\n\n"
     
     return event_generator()
 
