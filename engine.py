@@ -394,7 +394,7 @@ class CCtvMonitor:
                         track_id, "Unknown", 0.0, 'None', 'None', '', None
                     )
 
-                if det_score>=0.8:
+                if det_score>0.8:
                     height_f, width_f = face_img.shape[:2]
                     padding = 40
                     fx1_padded = max(x1 - padding, 0)
@@ -404,7 +404,7 @@ class CCtvMonitor:
 
                     cropped_face = face_img[fy1_padded:fy2_padded,
                                                     fx1_padded:fx2_padded]
-
+                    
                     try:
                         insertToDb(name,frame.copy(),cropped_face.copy(),face_img.copy(),det_score,track_id,gender,age,role,path) #TODO
                     except Exception as e:
