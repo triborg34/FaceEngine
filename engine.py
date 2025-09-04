@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import threading
+import requests
 from torchvision.models import resnet50
 from urllib.parse import urlparse
 import cv2
@@ -50,6 +51,8 @@ class CCtvMonitor:
         self.FRAME_DELAY = 1.0 / self.TARGET_FPS
         self.RETRY_LIMIT = 5
         self.RETRY_DELAY = 3
+        
+        self.score,self.padding,self.quality=self.loadConfig()[0:3]
 
         # Initialize models
         self.model = None
@@ -58,13 +61,7 @@ class CCtvMonitor:
 
         # Load database
         self.known_names = self.load_db()
-        self.db_queue = Queue(maxsize=1000)  # Limit queue size
-        self.db_task = None
-        self.stats = {
-            'processed': 0,
-            'queued': 0,
-            'failed': 0
-        }
+
 
         # Threading and process management
         self.process = None
@@ -88,6 +85,15 @@ class CCtvMonitor:
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])
         ])
+    
+    def loadConfig(self):
+        uri='http://127.0.0.1/api/collections/setting/records'
+        response=requests.get(uri)
+        data=response.json().get('items')[0]
+        
+        return float(data['score']),data['padding'],int(data['quality']),data['port']
+
+
 
     def load_image_searcher_model(self):
         model = resnet50(weights=None)  # don't load default
@@ -232,92 +238,6 @@ class CCtvMonitor:
                 'role': role
             }
 
-    async def start_background_processing(self):
-        """Start the background database processing task"""
-        logging.info("Start the background database processing task")
-        self.db_task = asyncio.create_task(self._process_db_queue())
-
-    async def stop_background_processing(self):
-        """Gracefully stop background processing"""
-        logging.info("Gracefully stop background processing")
-        if self.db_task:
-            self.db_task.cancel()
-            try:
-                await self.db_task
-            except asyncio.CancelledError:
-                pass
-
-    async def _process_db_queue(self):
-        """Background task to process database insertions"""
-        while True:
-            try:
-                # Get item from queue (blocks if empty)
-                data = await self.db_queue.get()
-
-                try:
-                    await insertToDb(
-                        data['name'],
-                        data['frame'],
-                        data['face'],
-                        data['human_crop'],
-                        data['score'],
-                        data['track_id'],
-                        data['gender'],
-                        data['age'],
-                        data['role'],
-                        data['path']
-                    )
-                    self.stats['processed'] += 1
-
-                except Exception as e:
-                    logging.error(f"Error inserting to DB: {e}")
-                    self.stats['failed'] += 1
-
-                finally:
-                    # Mark task as done
-                    self.db_queue.task_done()
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logging.error(f"Unexpected error in DB queue processor: {e}")
-                await asyncio.sleep(1)  # Prevent tight error loops
-
-    async def queue_db_insertion(self, name, frame, face, human_crop,
-                                 score, track_id, gender, age, role, path):
-        """Queue a database insertion (non-blocking)"""
-        try:
-            # Create a copy of image data to avoid reference issues
-            data = {
-                'name': name,
-                'frame': frame.copy(),  # Important: copy arrays
-                'face': face.copy(),
-                'human_crop': human_crop.copy(),
-                'score': score,
-                'track_id': track_id,
-                'gender': gender,
-                'age': age,
-                'role': role,
-                'path': path
-            }
-
-            # Try to add to queue (non-blocking)
-            self.db_queue.put_nowait(data)
-            self.stats['queued'] += 1
-
-        except asyncio.QueueFull:
-            logging.warning("Database queue is full, dropping frame data")
-            # Optionally: implement a strategy like dropping oldest items
-        except Exception as e:
-            logging.error(f"Error queuing DB insertion: {e}")
-
-    def get_queue_stats(self):
-        """Get current queue statistics"""
-        return {
-            **self.stats,
-            'queue_size': self.db_queue.qsize(),
-            'queue_full': self.db_queue.full()
-        }
 
     def recognize_face(self, embedding, fgender, fage):
         """Recognize face using embedding comparison"""
@@ -394,9 +314,9 @@ class CCtvMonitor:
                         track_id, "Unknown", 0.0, 'None', 'None', '', None
                     )
 
-                if det_score>0.8:
+                if det_score>self.score:
                     height_f, width_f = face_img.shape[:2]
-                    padding = 40
+                    padding = self.padding
                     fx1_padded = max(x1 - padding, 0)
                     fy1_padded = max(y1 - padding, 0)
                     fx2_padded = min(x2 + padding, width_f)
@@ -406,7 +326,7 @@ class CCtvMonitor:
                                                     fx1_padded:fx2_padded]
                     
                     try:
-                        insertToDb(name,frame.copy(),cropped_face.copy(),face_img.copy(),det_score,track_id,gender,age,role,path) #TODO
+                        insertToDb(name,frame.copy(),cropped_face.copy(),face_img.copy(),det_score,track_id,gender,age,role,path,self.quality) #TODO
                     except Exception as e:
                                 logging.error(f"Error inserting to DB: {e}")
                 

@@ -12,6 +12,7 @@ from ultralytics import YOLO
 from PIL import Image
 import logging
 
+
 import urllib.request
 
 
@@ -227,23 +228,23 @@ def load_embeddings_from_db():
 tempTime = None
 
 
-def savePicture(frame, croppedface, humancrop, name, track_id):
+def savePicture(frame, croppedface, humancrop, name, track_id,quality):
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     frame = Image.fromarray(frame)
     frame_loc = f'outputs/screenshot/s.{name}_{track_id}.jpg'
     frame.save(
-        f'{frame_loc}', "JPEG", quality=100, optimize=True)
+        f'{frame_loc}', "JPEG", quality=quality, optimize=True)
     # cropp
     croppedface = cv2.cvtColor(croppedface, cv2.COLOR_BGR2RGB)
     croppedface = Image.fromarray(croppedface)
     crop_loc = f'outputs/cropped/c.{name}_{track_id}.jpg'
     croppedface.save(
-        f'{crop_loc}', "JPEG", quality=100, optimize=True)
+        f'{crop_loc}', "JPEG", quality=quality, optimize=True)
     humancrop = cv2.cvtColor(humancrop, cv2.COLOR_BGR2RGB)
     humancrop = Image.fromarray(humancrop)
     human_loc = f'outputs/humancrop/c.{name}_{track_id}.jpg'
     humancrop.save(
-        f'{human_loc}', "JPEG", quality=100, optimize=True)
+        f'{human_loc}', "JPEG", quality=quality, optimize=True)
 
     return frame_loc, crop_loc, human_loc
 
@@ -290,7 +291,7 @@ def should_insert(name, track_id):
     return True
 
 
-def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender, age, role, path):
+def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender, age, role, path,quality):
     global tempTime
     url = "http://127.0.0.1:8091/api/collections/collection/records"
     timeNow = datetime.datetime.now()
@@ -307,7 +308,7 @@ def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender, age
         pass
     if should_insert(name, track_id):
         frame_loc, crop_loc, human_loc = savePicture(
-            frame, croppedface, humancrop, name, track_id)
+            frame, croppedface, humancrop, name, track_id,quality)
 
         recent_names.append(RecentEntry(
             name=name, track_id=track_id, time=datetime.datetime.now()))
