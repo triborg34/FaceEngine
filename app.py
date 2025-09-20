@@ -43,17 +43,18 @@ class KnownPersonFields(BaseModel):
     socialnumber: str
 
 # Global CCTV monitor instance
-cctv_monitor = None
+cctv_monitor = CCtvMonitor()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
-    global cctv_monitor
+    # global cctv_monitor
     
     # Startup
     logging.info("Starting CCTV Monitor application...")
     try:
-        cctv_monitor = CCtvMonitor()
+
         # Start the recognition worker
         # cctv_monitor.start()
         logging.info("CCTV Monitor initialized successfully")
@@ -427,7 +428,7 @@ app.mount("/web/app", StaticFiles(directory="build/web",
           html=True), name="flutter")
 if __name__ == "__main__":
     host = '0.0.0.0'
-    port = 8000
+    port =int(cctv_monitor.loadConfig()[3])
     
     logging.info(f"Starting server on {host}:{port}")
     webbrowser.open(f'http://127.0.0.1:{port}/web/app')
