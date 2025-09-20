@@ -12,3 +12,9 @@ log.txt
 log.txt
 
 uploads/
+pb_data/
+pb_migrations/
+CHANGELOG.md
+LICENSE.md
+pocketbase.exe
+build/

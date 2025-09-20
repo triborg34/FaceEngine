@@ -9,6 +9,7 @@ import time
 import webbrowser
 import base64
 from contextlib import asynccontextmanager
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from fastapi import FastAPI, File, Query, Request, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,7 +55,7 @@ async def lifespan(app: FastAPI):
     try:
         cctv_monitor = CCtvMonitor()
         # Start the recognition worker
-        cctv_monitor.start()
+        # cctv_monitor.start()
         logging.info("CCTV Monitor initialized successfully")
     except Exception as e:
         logging.error(f"Failed to initialize CCTV Monitor: {e}")
@@ -125,7 +126,7 @@ async def video_feed(camera_id: str, request: Request, source: str = Query(...),
                 target=cctv_monitor.recognition_worker,
                 daemon=True
             ).start()
-                await cctv_monitor.start_background_processing()
+
             
                 
         
@@ -421,12 +422,15 @@ async def querySearch(fileLocation:str):
     logging.info(ids)
     return ids
 
+
+app.mount("/web/app", StaticFiles(directory="build/web",
+          html=True), name="flutter")
 if __name__ == "__main__":
     host = '0.0.0.0'
     port = 8000
     
     logging.info(f"Starting server on {host}:{port}")
-    
+    webbrowser.open(f'http://127.0.0.1:{port}/web/app')
     try:
         uvicorn.run(
             "app:app", 

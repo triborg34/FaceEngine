@@ -44,6 +44,7 @@ cv2.setNumThreads(multiprocessing.cpu_count())
 
 class CCtvMonitor:
     def __init__(self):
+        self.start()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.frps = 5 if self.device == 'cuda' else 25
         self.MODEL_PATH = os.getenv("MODEL_PATH", "models/yolov8n.pt")
@@ -51,16 +52,16 @@ class CCtvMonitor:
         self.FRAME_DELAY = 1.0 / self.TARGET_FPS
         self.RETRY_LIMIT = 5
         self.RETRY_DELAY = 3
-        
+        # self.start()
         self.score,self.padding,self.quality=self.loadConfig()[0:3]
 
         # Initialize models
         self.model = None
         self.face_handler = None
         self._load_models()
-
-        # Load database
         self.known_names = self.load_db()
+        # Load database
+        
 
 
         # Threading and process management
@@ -87,7 +88,7 @@ class CCtvMonitor:
         ])
     
     def loadConfig(self):
-        uri='http://127.0.0.1/api/collections/setting/records'
+        uri='http://127.0.0.1:8091/api/collections/setting/records'
         response=requests.get(uri)
         data=response.json().get('items')[0]
         
@@ -168,13 +169,13 @@ class CCtvMonitor:
         except Exception as e:
             logging.error(f"Failed to load models: {e}")
             raise
-
+    def start(self):
+        process = subprocess.Popen(
+                        ["pocketbase", "serve", "--http=0.0.0.0:8091"], creationflags=subprocess.CREATE_NO_WINDOW)
+        logging.info(f"PocketBase stater {process.pid}")              
     def load_db(self):
         """Load known faces from database"""
         try:
-            # process = subprocess.Popen(
-            #         #     ["pocketbase", "serve", "--http=0.0.0.0:8091"], creationflags=subprocess.CREATE_NO_WINDOW,)
-            #         # logging.info(f"PocketBase stater {process.pid}")
             known_names = load_embeddings_from_db()
             logging.info(
                 f"Loaded {len(known_names)} known faces from database")
@@ -222,7 +223,6 @@ class CCtvMonitor:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.process.kill()
-        await self.stop_background_processing()
         logging.info("Cleanup complete.")
 
     def update_face_info(self, track_id, name, score, gender, age, role, bbox=None):
@@ -339,18 +339,6 @@ class CCtvMonitor:
 
         logging.info("Recognition worker stopped.")
 
-    def start(self):
-        # if not os.path.exists(self.EMBEDDING_FILE) or not os.path.exists(self.FILENAMES_FILE):
-        # self.precompute_embeddings(
-        #         self.load_image_searcher_model(), self.FOLDER_PATH)
-        """Start the recognition worker thread"""
-        # recognition_thread = threading.Thread(
-        #     target=self.recognition_worker,
-        #     daemon=True
-        # )
-        # recognition_thread.start()
-        # return recognition_thread
-
     async def process_frame(self, frame, path, counter):
         """Process a single frame for object detection and face recognition"""
         try:
@@ -369,7 +357,8 @@ class CCtvMonitor:
                 classes=[0],  # Person class
                 tracker="bytetrack.yaml",
                 persist=True,
-                device=self.device
+                device=self.device,
+                conf=0.7
             )
 
             if results and len(results[0].boxes) > 0:
