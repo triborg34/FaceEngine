@@ -147,13 +147,14 @@ class CCtvMonitor:
         results = [(filenames[i], sims[i]) for i in sorted_indices[:top_k]]
         return results
 
+   
     def _load_models(self):
         """Load YOLO and face recognition models"""
         try:
             logging.info("Loading models...")
 
             # Load face handler
-            self.face_handler = FaceAnalysis(
+            self.face_handler = FaceAnalysis(#TODO:CHANGE THIS
                 'buffalo_l',
                 providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
                 root='.'
@@ -169,10 +170,12 @@ class CCtvMonitor:
         except Exception as e:
             logging.error(f"Failed to load models: {e}")
             raise
+    
     def start(self):
         process = subprocess.Popen(
                         ["pocketbase", "serve", "--http=0.0.0.0:8091"], creationflags=subprocess.CREATE_NO_WINDOW)
         logging.info(f"PocketBase stater {process.pid}")              
+    
     def load_db(self):
         """Load known faces from database"""
         try:
@@ -358,7 +361,7 @@ class CCtvMonitor:
                 tracker="bytetrack.yaml",
                 persist=True,
                 device=self.device,
-                conf=0.7
+                conf=0.7#TODO:GET CONF IN SETTING
             )
 
             if results and len(results[0].boxes) > 0:
@@ -597,7 +600,7 @@ def image_searcher(file_path):
         return None
 
 
-def image_crop(filepath, isSearch):
+def image_crop(filepath, isSearch):#TODO:CHANGE MODEL TO SAME AS ORIGINAL MODEL
     """Crop face from image with padding"""
     if isSearch:
         frame = cv2.imread(filepath)
