@@ -44,6 +44,7 @@ cv2.setNumThreads(multiprocessing.cpu_count())
 
 class CCtvMonitor:
     def __init__(self):
+        self.processer = None
         self.start()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.frps = 5 if self.device == 'cuda' else 25
@@ -52,8 +53,7 @@ class CCtvMonitor:
         self.FRAME_DELAY = 1.0 / self.TARGET_FPS
         self.RETRY_LIMIT = 5
         self.RETRY_DELAY = 3
-        # self.start()
-        self.score,self.padding,self.quality=self.loadConfig()[0:3]
+        self.score, self.padding, self.quality = self.loadConfig()[0:3]
 
         # Initialize models
         self.model = None
@@ -61,11 +61,9 @@ class CCtvMonitor:
         self._load_models()
         self.known_names = self.load_db()
         # Load database
-        
-
 
         # Threading and process management
-        self.process = None
+
         self.lock = threading.Lock()
         self.recognition_queue = queue.Queue()
         self.face_info = {}
@@ -86,15 +84,13 @@ class CCtvMonitor:
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])
         ])
-    
+
     def loadConfig(self):
-        uri='http://127.0.0.1:8091/api/collections/setting/records'
-        response=requests.get(uri)
-        data=response.json().get('items')[0]
-        
-        return float(data['score']),data['padding'],int(data['quality']),data['port']
+        uri = 'http://127.0.0.1:8091/api/collections/setting/records'
+        response = requests.get(uri)
+        data = response.json().get('items')[0]
 
-
+        return float(data['score']), data['padding'], int(data['quality']), data['port']
 
     def load_image_searcher_model(self):
         model = resnet50(weights=None)  # don't load default
@@ -147,15 +143,14 @@ class CCtvMonitor:
         results = [(filenames[i], sims[i]) for i in sorted_indices[:top_k]]
         return results
 
-   
     def _load_models(self):
         """Load YOLO and face recognition models"""
         try:
             logging.info("Loading models...")
 
             # Load face handler
-            self.face_handler = FaceAnalysis(#TODO:CHANGE THIS
-                'buffalo_l',
+            self.face_handler = FaceAnalysis(  # TODO:CHANGE THIS
+                'antelopev2',
                 providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
                 root='.'
             )
@@ -170,12 +165,13 @@ class CCtvMonitor:
         except Exception as e:
             logging.error(f"Failed to load models: {e}")
             raise
-    
+
     def start(self):
-        process = subprocess.Popen(
-                        ["pocketbase", "serve", "--http=0.0.0.0:8091"], creationflags=subprocess.CREATE_NO_WINDOW)
-        logging.info(f"PocketBase stater {process.pid}")              
-    
+        self.processer = subprocess.Popen(
+            ["pocketbase", "serve", "--http=0.0.0.0:8091"], creationflags=subprocess.CREATE_NO_WINDOW)
+        logging.info(f"PocketBase stater {self.processer.pid}")
+        print(self.processer.pid)
+
     def load_db(self):
         """Load known faces from database"""
         try:
@@ -197,7 +193,6 @@ class CCtvMonitor:
             # Signal recognition worker to stop
             if not role:
                 self.recognition_queue.put(None)
-                await self.stop_background_processing()
         except Exception as e:
             logging.error(f"Error releasing camera resources: {e}")
 
@@ -220,12 +215,12 @@ class CCtvMonitor:
         gc.collect()
 
         # Terminate subprocess if exists
-        if self.process:
+        if self.processer:
             try:
-                self.process.terminate()
-                self.process.wait(timeout=5)
+                self.processer.terminate()
+                self.processer.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self.process.kill()
+                self.processer.kill()
         logging.info("Cleanup complete.")
 
     def update_face_info(self, track_id, name, score, gender, age, role, bbox=None):
@@ -240,7 +235,6 @@ class CCtvMonitor:
                 'age': age,
                 'role': role
             }
-
 
     def recognize_face(self, embedding, fgender, fage):
         """Recognize face using embedding comparison"""
@@ -287,7 +281,7 @@ class CCtvMonitor:
                 if item is None:
                     break
 
-                frame,path,track_id, face_img = item
+                frame, path, track_id, face_img = item
                 # Skip if recently updated (performance optimization)
                 with self.face_info_lock:
                     if (track_id in self.face_info and
@@ -301,7 +295,9 @@ class CCtvMonitor:
                     face = faces[0]
                     gender = 'female' if face.gender == 0 else 'male'
                     age = face.age
+
                     det_score = float(face.det_score)
+                   
                     name, sim, gender, age, role = self.recognize_face(
                         face.embedding, gender, age
                     )
@@ -312,28 +308,28 @@ class CCtvMonitor:
                             x1, y1, x2, y2)
                     )
                     self.embedding_cache[track_id] = face.embedding
+                    if det_score > self.score:
+                        height_f, width_f = face_img.shape[:2]
+                        padding = self.padding
+                        fx1_padded = max(x1 - padding, 0)
+                        fy1_padded = max(y1 - padding, 0)
+                        fx2_padded = min(x2 + padding, width_f)
+                        fy2_padded = min(y2 + padding, height_f)
+
+                        cropped_face = face_img[fy1_padded:fy2_padded,
+                                                fx1_padded:fx2_padded]
+
+                        try:
+                            insertToDb(name, frame.copy(), cropped_face.copy(), face_img.copy(
+                            ), det_score, track_id, gender, age, role, path, self.quality)  # TODO
+                        except Exception as e:
+                            logging.error(f"Error inserting to DB: {e}")
                 else:
                     self.update_face_info(
                         track_id, "Unknown", 0.0, 'None', 'None', '', None
                     )
 
-                if det_score>self.score:
-                    height_f, width_f = face_img.shape[:2]
-                    padding = self.padding
-                    fx1_padded = max(x1 - padding, 0)
-                    fy1_padded = max(y1 - padding, 0)
-                    fx2_padded = min(x2 + padding, width_f)
-                    fy2_padded = min(y2 + padding, height_f)
 
-                    cropped_face = face_img[fy1_padded:fy2_padded,
-                                                    fx1_padded:fx2_padded]
-                    
-                    try:
-                        insertToDb(name,frame.copy(),cropped_face.copy(),face_img.copy(),det_score,track_id,gender,age,role,path,self.quality) #TODO
-                    except Exception as e:
-                                logging.error(f"Error inserting to DB: {e}")
-                
-                    
 
             except queue.Empty:
                 continue  # Timeout, check shutdown event
@@ -361,7 +357,7 @@ class CCtvMonitor:
                 tracker="bytetrack.yaml",
                 persist=True,
                 device=self.device,
-                conf=0.7#TODO:GET CONF IN SETTING
+                conf=0.7  # TODO:GET CONF IN SETTING
             )
 
             if results and len(results[0].boxes) > 0:
@@ -386,7 +382,8 @@ class CCtvMonitor:
                     # if counter % self.frps == 0:
                     #   stats=self.get_queue_stats()
                     #   logging.info(f"Queue: {stats['queue_size']}, Processed: {stats['processed']}, Failed: {stats['failed']}")
-                    self.recognition_queue.put((processed_frame.copy(),path,track_id, human_crop))
+                    self.recognition_queue.put(
+                        (processed_frame.copy(), path, track_id, human_crop))
 
                     # Get face info
                     with self.face_info_lock:
@@ -600,7 +597,7 @@ def image_searcher(file_path):
         return None
 
 
-def image_crop(filepath, isSearch):#TODO:CHANGE MODEL TO SAME AS ORIGINAL MODEL
+def image_crop(filepath, isSearch):  # TODO:CHANGE MODEL TO SAME AS ORIGINAL MODEL
     """Crop face from image with padding"""
     if isSearch:
         frame = cv2.imread(filepath)
@@ -642,9 +639,9 @@ def image_crop(filepath, isSearch):#TODO:CHANGE MODEL TO SAME AS ORIGINAL MODEL
 
 
 if __name__ == "__main__":
-    a=CCtvMonitor()
+    a = CCtvMonitor()
     a.recognition_worker()
-    a.generate_frames('/rt1','rtsp://192.168.1.10:554/stream',Request,False)
+    a.generate_frames('/rt1', 'rtsp://192.168.1.10:554/stream', Request, False)
     # a = CCtvMonitor()
     # embeddings, filenames = a.load_embeddings()
 
