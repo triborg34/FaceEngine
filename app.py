@@ -43,14 +43,14 @@ class KnownPersonFields(BaseModel):
     socialnumber: str
 
 # Global CCTV monitor instance
-cctv_monitor = CCtvMonitor()
+# cctv_monitor = CCtvMonitor()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
-    # global cctv_monitor
-    # cctv_monitor = CCtvMonitor()
+    global cctv_monitor
+    cctv_monitor = CCtvMonitor()
     # Startup
     logging.info("Starting CCTV Monitor application...")
     try:
@@ -428,15 +428,21 @@ async def querySearch(fileLocation:str):
 
 app.mount("/web/app", StaticFiles(directory="build/web",
           html=True), name="flutter")
-def getPort():
-        uri='http://127.0.0.1:8091/api/collections/setting/records'
-        response=requests.get(uri)
-        data=response.json().get('items')[0]
+def updatePort():
+    port=cctv_monitor.loadConfig()[3]
+    with open('hostname.json','w') as file:
+        json.dump({'port':port}, file, indent=4)
+    return 0
+    
+
+def readPort() :
+    with open('hostname.json','r') as file:
+        data=json.load(file)
+        return data['port']
         
-        return int(data['port'])
 if __name__ == "__main__":
     host = '0.0.0.0'
-    port=int(cctv_monitor.loadConfig()[3])
+    port=int(readPort())
     logging.info(f"Starting server on {host}:{port}")
     webbrowser.open(f'http://127.0.0.1:{port}/web/app')
     try:
