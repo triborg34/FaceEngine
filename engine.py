@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import threading
+import webbrowser
 import requests
 from torchvision.models import resnet50
 from urllib.parse import urlparse
@@ -53,7 +54,7 @@ class CCtvMonitor:
         self.FRAME_DELAY = 1.0 / self.TARGET_FPS
         self.RETRY_LIMIT = 5
         self.RETRY_DELAY = 3
-        self.score, self.padding, self.quality = self.loadConfig()[0:3]
+        self.score, self.padding, self.quality,self.port = self.loadConfig()[0:4]
 
         # Initialize models
         self.model = None
@@ -84,7 +85,11 @@ class CCtvMonitor:
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])
         ])
+    
+        self.loadWebBrowser(self.port)
 
+    def loadWebBrowser(self,port):
+        webbrowser.open(f'http://127.0.0.1:{port}/web/app')
     def loadConfig(self):
         uri = 'http://127.0.0.1:8091/api/collections/setting/records'
         response = requests.get(uri)

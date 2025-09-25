@@ -64,6 +64,7 @@ async def lifespan(app: FastAPI):
     
     yield
     
+    updatePort()
     # Shutdown
     logging.info("Shutting down CCTV Monitor application...")
     if cctv_monitor:
@@ -444,7 +445,6 @@ if __name__ == "__main__":
     host = '0.0.0.0'
     port=int(readPort())
     logging.info(f"Starting server on {host}:{port}")
-    webbrowser.open(f'http://127.0.0.1:{port}/web/app')
     try:
         uvicorn.run(
             "app:app", 
