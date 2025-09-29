@@ -48,7 +48,7 @@ cv2.setNumThreads(multiprocessing.cpu_count())
 class CCtvMonitor:
     def __init__(self):
         self.process = None
-        # self.start()
+        self.start()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.frps = 5 if self.device == 'cuda' else 25
         self.MODEL_PATH = os.getenv("MODEL_PATH", "models/yolov8n.pt")
