@@ -95,7 +95,7 @@ class CCtvMonitor:
             self.background_subtractor = cv2.createBackgroundSubtractorMOG2()
             self.k = []
 
-        # self.loadWebBrowser(self.port)
+        self.loadWebBrowser(self.port)
 
     def loadWebBrowser(self, port):
         webbrowser.open(f'http://127.0.0.1:{port}/web/app')
@@ -305,9 +305,9 @@ class CCtvMonitor:
             raise
 
     def start(self):
-        self.processer = subprocess.Popen(
+        self.process = subprocess.Popen(
             ["pocketbase", "serve", "--http=0.0.0.0:8091"], creationflags=subprocess.CREATE_NO_WINDOW)
-        logging.info(f"PocketBase stater {self.processer.pid}")
+        logging.info(f"PocketBase stater {self.process.pid}")
 
     def load_db(self):
         """Load known faces from database"""
@@ -353,6 +353,7 @@ class CCtvMonitor:
         gc.collect()
 
         # Terminate subprocess if exists
+        print(self.process.pid)
         if self.process:
             try:
                 self.process.terminate()

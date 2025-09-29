@@ -416,10 +416,8 @@ async def querySearch(fileLocation:str):
     cctv_monitor.precompute_embeddings(
                 cctv_monitor.load_image_searcher_model(), cctv_monitor.FOLDER_PATH)
     embeddings, filenames = cctv_monitor.load_embeddings()
-    print(filenames)
     query_path=fileLocation.replace('\\','/')
     query_embedding = cctv_monitor.get_embedding( query_path)
-    print(query_embedding)
     results = cctv_monitor.find_similar_images(query_embedding, embeddings, filenames, top_k=10)
     if results ==[]:
         return []
