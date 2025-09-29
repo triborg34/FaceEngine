@@ -1,5 +1,6 @@
 import datetime
 import os
+import time
 from typing import NamedTuple
 from urllib.request import urlopen
 import cv2
@@ -11,7 +12,7 @@ import json
 from ultralytics import YOLO
 from PIL import Image
 import logging
-
+from nrcpy import NrcDevice
 
 import urllib.request
 
@@ -31,9 +32,9 @@ logging.basicConfig(
 def reciveFromUi(name, imagePath, age, gender, role, socialnumber, isUrl):
     """
     Receive data from the UI and process it.
-    """ 
+    """
     face_embedder = FaceAnalysis('antelopev2', providers=[
-        'CUDAExecutionProvider', 'CPUExecutionProvider'],root='.')
+        'CUDAExecutionProvider', 'CPUExecutionProvider'], root='.')
     face_embedder.prepare(ctx_id=0)
     model = YOLO('models/yolov8n.pt')
     if isUrl:
@@ -188,8 +189,6 @@ def load_embeddings_from_db():
             gender = item.get('gender')
             role = item.get('role')
 
-            print(f"{age=},{gender=}")
-
             if embedding:
                 embedding = embedding[:len(embedding) - (len(embedding) % 512)]
                 try:
@@ -228,7 +227,7 @@ def load_embeddings_from_db():
 tempTime = None
 
 
-def savePicture(frame, croppedface, humancrop, name, track_id,quality):
+def savePicture(frame, croppedface, humancrop, name, track_id, quality):
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     frame = Image.fromarray(frame)
     frame_loc = f'outputs/screenshot/s.{name}_{track_id}.jpg'
@@ -291,7 +290,7 @@ def should_insert(name, track_id):
     return True
 
 
-def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender, age, role, path,quality):
+def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender, age, role, path, quality, regions, isRelay: bool, isRegionMode: bool, ip_relay, port_relay, relayn1, relayn2):
     global tempTime
     url = "http://127.0.0.1:8091/api/collections/collection/records"
     timeNow = datetime.datetime.now()
@@ -308,20 +307,23 @@ def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender, age
         pass
     if should_insert(name, track_id):
         frame_loc, crop_loc, human_loc = savePicture(
-            frame, croppedface, humancrop, name, track_id,quality)
+            frame, croppedface, humancrop, name, track_id, quality)
 
         recent_names.append(RecentEntry(
             name=name, track_id=track_id, time=datetime.datetime.now()))
+        if isRegionMode:
+            relay_ip, relay_region, relay_number = regions[
+                'relay_ip'], regions['name'], regions['relay_number']
 
-        with open(frame_loc, "rb") as file1, open(crop_loc, "rb") as file2,open(human_loc,'rb') as file3:
+        with open(frame_loc, "rb") as file1, open(crop_loc, "rb") as file2, open(human_loc, 'rb') as file3:
             files = {
                 # Change field name if needed
                 "frame": (frame_loc, file1, "image/jpeg"),
                 # Change field name if needed
                 "cropped_frame": (crop_loc, file2, "image/jpeg"),
-                "humancrop":(human_loc,file3,"image/jpeg")
+                "humancrop": (human_loc, file3, "image/jpeg")
             }
-            
+
             response = requests.post(url, files=files, data={
                 "name": name,
                 "score": score,
@@ -332,13 +334,52 @@ def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender, age
                 'time': display_time,
                 'role': role,
                 "track_id": str(track_id),
-                'filename':human_loc.split('/')[2]
+                'filename': human_loc.split('/')[2]
             })
         if response.status_code in [200, 201]:
 
             logging.info(response.json()['id'])
+            if role == 'approve' and isRelay and isRegionMode:
+                handle_relay_operations(
+                    relay_ip, 23, 'admin', 'admin', int(relay_number))
+
+            elif role == 'approve' and isRelay:
+                if relayn1 == 1 and relayn2 == 2:
+                    handle_relay_operations(ip_relay, int(
+                        port_relay), 'admin', 'admin', int(relayn1))
+                    time.sleep(1)
+                    handle_relay_operations(ip_relay, int(
+                        port_relay), 'admin', 'admin', int(relayn2))
+
+                elif relayn1 == 1:
+                    handle_relay_operations(ip_relay.strip(), int(
+                        port_relay), 'admin', 'admin', int(relayn1))
+                elif relayn2 == 2:
+                    handle_relay_operations(ip_relay, int(
+                        port_relay), 'admin', 'admin', int(relayn2))
+                else:
+                    pass
+
         else:
             logging.error("Error:", response.text)
+
+
+def handle_relay_operations(ip='192.168.1.200', port=23, username='admin', password='admin', relay_number=1):
+    """Handle IP relay operations - single execution"""
+    try:
+        print(f"Executing relay operation for {ip}")
+        nrc = NrcDevice((ip, port, username, password))
+
+        nrc.connect()
+        if nrc.login():
+            nrc.relayContact(relay_number, 300)
+            print(f"Relay operation completed for {ip}")
+        nrc.disconnect()
+    except Exception as e:
+        print(f"Relay error for {ip}: {e}")
+
+    except Exception as e:
+        print(f"Error in relay operations: {e}")
 
 
 def log_detection(name, track_id):

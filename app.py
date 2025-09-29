@@ -42,8 +42,14 @@ class KnownPersonFields(BaseModel):
     role: str
     socialnumber: str
 
+
+class RelayConfig(BaseModel):
+    ip:str
+    port:int
+    username:str
+    password:str
 # Global CCTV monitor instance
-# cctv_monitor = CCtvMonitor()
+
 
 
 @asynccontextmanager
@@ -51,10 +57,11 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     global cctv_monitor
     cctv_monitor = CCtvMonitor()
+    
     # Startup
     logging.info("Starting CCTV Monitor application...")
     try:
-
+        
         # Start the recognition worker
         # cctv_monitor.start()
         logging.info("CCTV Monitor initialized successfully")
@@ -64,7 +71,6 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    updatePort()
     # Shutdown
     logging.info("Shutting down CCTV Monitor application...")
     if cctv_monitor:
@@ -410,9 +416,13 @@ async def querySearch(fileLocation:str):
     cctv_monitor.precompute_embeddings(
                 cctv_monitor.load_image_searcher_model(), cctv_monitor.FOLDER_PATH)
     embeddings, filenames = cctv_monitor.load_embeddings()
+    print(filenames)
     query_path=fileLocation.replace('\\','/')
     query_embedding = cctv_monitor.get_embedding( query_path)
+    print(query_embedding)
     results = cctv_monitor.find_similar_images(query_embedding, embeddings, filenames, top_k=10)
+    if results ==[]:
+        return []
     response=requests.get('http://127.0.0.1:8091/api/collections/collection/records')
     res=response.json()['items']
     ids=[]
@@ -423,9 +433,6 @@ async def querySearch(fileLocation:str):
         
     logging.info(ids)
     return ids
-
-
-
 
 app.mount("/web/app", StaticFiles(directory="build/web",
           html=True), name="flutter")
@@ -440,11 +447,17 @@ def readPort() :
     with open('hostname.json','r') as file:
         data=json.load(file)
         return data['port']
-        
 if __name__ == "__main__":
+    
+    # cctv_monitor =CCtvMonitor()
     host = '0.0.0.0'
+    # port =int(cctv_monitor.loadConfig()[3])
     port=int(readPort())
+    #TODO:ADD HOSTNAME AND PORT AND SEE IF ANY THING CHANGE IN THAT CODE
+    
+    
     logging.info(f"Starting server on {host}:{port}")
+    # webbrowser.open(f'http://127.0.0.1:{port}/web/app')
     try:
         uvicorn.run(
             "app:app", 

@@ -27,6 +27,8 @@ from savatoDb import load_embeddings_from_db, insertToDb
 import torch.nn as nn
 from PIL import Image
 from torchvision.transforms import transforms
+import json
+
 
 # --- Basic Setup ---
 logging.getLogger('torch').setLevel(logging.ERROR)
@@ -45,8 +47,8 @@ cv2.setNumThreads(multiprocessing.cpu_count())
 
 class CCtvMonitor:
     def __init__(self):
-        self.processer = None
-        self.start()
+        self.process = None
+        # self.start()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.frps = 5 if self.device == 'cuda' else 25
         self.MODEL_PATH = os.getenv("MODEL_PATH", "models/yolov8n.pt")
@@ -54,7 +56,9 @@ class CCtvMonitor:
         self.FRAME_DELAY = 1.0 / self.TARGET_FPS
         self.RETRY_LIMIT = 5
         self.RETRY_DELAY = 3
-        self.score, self.padding, self.quality,self.port = self.loadConfig()[0:4]
+        self.ip_relay,self.ip_port,self.relayN1,self.relayN2='','','',''
+        self.score, self.padding, self.quality, self.hscore, self.simscore, self.port, self.isRegionMode, self.isRelay = self.loadConfig()
+        
 
         # Initialize models
         self.model = None
@@ -85,17 +89,144 @@ class CCtvMonitor:
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                  std=[0.229, 0.224, 0.225])
         ])
-    
-        self.loadWebBrowser(self.port)
 
-    def loadWebBrowser(self,port):
+        # regions
+        if self.isRegionMode:
+            self.background_subtractor = cv2.createBackgroundSubtractorMOG2()
+            self.k = []
+
+        # self.loadWebBrowser(self.port)
+
+    def loadWebBrowser(self, port):
         webbrowser.open(f'http://127.0.0.1:{port}/web/app')
+
+    def load_regions(self, soruce, file_path='regions.json',):
+        url = urlparse(soruce).hostname
+        """Load regions from JSON file"""
+        try:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+
+                if url == data['ip']:
+                    return data.get('regions', {})
+                else:
+                    pass
+
+        except Exception as e:
+            print(f"Error loading regions: {e}")
+            return {}
+
+    def draw_regions_on_frame(self, frame, regions):
+        """Draw region boundaries on frame"""
+        overlay = frame.copy()
+
+        for region_name, region_data in regions.items():
+            points = region_data.get('points', [])
+            color_name = region_data.get('color', 'red')
+            shape_type = region_data.get('shape_type', 'polygon')
+
+            # Convert color name to BGR
+            color_map = {
+                'red': (0, 0, 255), 'blue': (255, 0, 0), 'green': (0, 255, 0),
+                'yellow': (0, 255, 255), 'purple': (128, 0, 128),
+                'orange': (0, 165, 255), 'cyan': (255, 255, 0), 'magenta': (255, 0, 255)
+            }
+            color = color_map.get(color_name, (0, 0, 255))
+
+            if shape_type == 'polygon' and len(points) > 2:
+                pts = np.array(points, dtype=np.int32)
+                cv2.polylines(overlay, [pts], True, color, 2)
+
+            elif shape_type == 'rectangle' and len(points) == 4:
+                x1, y1 = int(points[0][0]), int(points[0][1])
+                x2, y2 = int(points[2][0]), int(points[2][1])
+                cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+
+            elif shape_type == 'line' and len(points) == 2:
+                x1, y1 = int(points[0][0]), int(points[0][1])
+                x2, y2 = int(points[1][0]), int(points[1][1])
+                cv2.line(overlay, (x1, y1), (x2, y2), color, 2)
+
+            # Add region label
+            if points:
+                center_x = int(sum(p[0] for p in points) / len(points))
+                center_y = int(sum(p[1] for p in points) / len(points))
+
+                # Add background for text
+                text = f"{region_name} (ID: {region_data.get('id', 'N/A')})"
+                text_size = cv2.getTextSize(
+                    text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+                # cv2.rectangle(overlay, (center_x - text_size[0]//2 - 5, center_y - text_size[1] - 5),
+                #               (center_x + text_size[0]//2 + 5, center_y + 5), (0, 0, 0), -1)
+                # cv2.putText(overlay, text, (center_x - text_size[0]//2, center_y),
+                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        return overlay
+
+    def get_detection_region(self, detection_box, region_masks):
+
+        cx = int((detection_box[0] + detection_box[2]) / 2)
+        cy = int((detection_box[1] + detection_box[3]) / 2)
+        for region_name, mask in region_masks.items():
+
+            if cy < mask.shape[0] and cx < mask.shape[1] and mask[cy, cx] > 0:
+                return region_name  # First match wins
+        return None
+
+    def generate_region_masks(self, frame_shape, regions):
+        """Create binary masks for each region (once)"""
+        h, w, _ = frame_shape
+        masks = {}
+        for region_name, region_data in regions.items():
+            points = region_data.get('points', [])
+            shape_type = region_data.get('shape_type', 'polygon')
+
+            mask = np.zeros((h, w), dtype=np.uint8)
+
+            if shape_type == 'polygon' and len(points) > 2:
+                pts = np.array(points, dtype=np.int32)
+                cv2.fillPoly(mask, [pts], 255)
+
+            elif shape_type == 'rectangle' and len(points) == 4:
+                x1, y1 = int(points[0][0]), int(points[0][1])
+                x2, y2 = int(points[2][0]), int(points[2][1])
+                cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+
+            elif shape_type == 'line' and len(points) == 2:
+                x1, y1 = int(points[0][0]), int(points[0][1])
+                x2, y2 = int(points[1][0]), int(points[1][1])
+                cv2.line(mask, (x1, y1), (x2, y2), 255, 2)  # use thickness
+
+            masks[region_name] = mask
+        return masks
+
+    def onDisplay(self, region, frame):
+        """Display region names on frame"""
+        if not region:  # More pythonic than len(region) == 0
+            return
+
+        # Display up to the first few regions with proper spacing
+        y_offset = 30  # Starting Y position
+        line_height = 50  # Space between lines
+
+        # Limit to 5 regions to avoid overcrowding
+        for i, reg in enumerate(region[:5]):
+            if 'name' in reg:
+                y_pos = y_offset + (i * line_height)
+                cv2.putText(frame, reg['name'], (10, y_pos),
+                            cv2.FONT_HERSHEY_COMPLEX_SMALL, 1, (255, 255, 255))
+
     def loadConfig(self):
         uri = 'http://127.0.0.1:8091/api/collections/setting/records'
         response = requests.get(uri)
         data = response.json().get('items')[0]
-
-        return float(data['score']), data['padding'], int(data['quality']), data['port']
+        if data['isRfid']:
+            self.ip_relay,self.ip_port,self.relayN1,self.relayN2=data['rfidip'].strip(),data['rfidport'],data['rl1'],data['rl2']
+        if data['rl1']:
+            self.relayN1=1
+        if data['rl2']:
+            self.relayN2=2
+        return float(data['score']), data['padding'], int(data['quality']), float(data['hscore']), float(data['simscore']), data['port'], data['isregion'], data['isRfid']
 
     def load_image_searcher_model(self):
         model = resnet50(weights=None)  # don't load default
@@ -144,17 +275,19 @@ class CCtvMonitor:
 
     def find_similar_images(self, query_embedding, embeddings, filenames, top_k=10):
         sims = cosine_similarity([query_embedding], embeddings)[0]
-        sorted_indices = np.argsort(sims)[::-1]
-        results = [(filenames[i], sims[i]) for i in sorted_indices[:top_k]]
-        return results
+        if sims[0] > 0.7:
+            sorted_indices = np.argsort(sims)[::-1]
+            results = [(filenames[i], sims[i]) for i in sorted_indices[:top_k]]
+            return results
+        return []
 
     def _load_models(self):
         """Load YOLO and face recognition models"""
         try:
-            logging.info("Loading models...")
+            logging.info(f"Loading models...")
 
             # Load face handler
-            self.face_handler = FaceAnalysis(  # TODO:CHANGE THIS
+            self.face_handler = FaceAnalysis(
                 'antelopev2',
                 providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
                 root='.'
@@ -175,7 +308,6 @@ class CCtvMonitor:
         self.processer = subprocess.Popen(
             ["pocketbase", "serve", "--http=0.0.0.0:8091"], creationflags=subprocess.CREATE_NO_WINDOW)
         logging.info(f"PocketBase stater {self.processer.pid}")
-        print(self.processer.pid)
 
     def load_db(self):
         """Load known faces from database"""
@@ -198,6 +330,7 @@ class CCtvMonitor:
             # Signal recognition worker to stop
             if not role:
                 self.recognition_queue.put(None)
+
         except Exception as e:
             logging.error(f"Error releasing camera resources: {e}")
 
@@ -220,12 +353,12 @@ class CCtvMonitor:
         gc.collect()
 
         # Terminate subprocess if exists
-        if self.processer:
+        if self.process:
             try:
-                self.processer.terminate()
-                self.processer.wait(timeout=5)
+                self.process.terminate()
+                self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self.processer.kill()
+                self.process.kill()
         logging.info("Cleanup complete.")
 
     def update_face_info(self, track_id, name, score, gender, age, role, bbox=None):
@@ -251,6 +384,7 @@ class CCtvMonitor:
 
         try:
             for name, person_data in self.known_names.items():
+
                 age = person_data['age']
                 gender = person_data['gender']
                 role = person_data['role']
@@ -258,17 +392,23 @@ class CCtvMonitor:
 
                 for known_emb in embeds:
                     sim = cosine_similarity([embedding], [known_emb])[0][0]
-                    if sim > best_score:
+
+                    if sim >= self.simscore:
                         best_score = sim
                         best_match = name
                         best_age = age
                         best_gender = gender
                         best_role = role
+                    #     return best_match, best_score, best_gender, best_age, best_role
+                    # else:
+                    #     return "unknown", best_score, fgender, fage, best_role
 
             # Threshold for recognition
-            if best_score >= 0.6:
+            if best_match != 'unknown':
+
                 return best_match, best_score, best_gender, best_age, best_role
             else:
+
                 return "unknown", best_score, fgender, fage, best_role
 
         except Exception as e:
@@ -286,7 +426,7 @@ class CCtvMonitor:
                 if item is None:
                     break
 
-                frame, path, track_id, face_img = item
+                frame, path, track_id, face_img, region_data = item
                 # Skip if recently updated (performance optimization)
                 with self.face_info_lock:
                     if (track_id in self.face_info and
@@ -300,12 +440,11 @@ class CCtvMonitor:
                     face = faces[0]
                     gender = 'female' if face.gender == 0 else 'male'
                     age = face.age
-
                     det_score = float(face.det_score)
-                   
                     name, sim, gender, age, role = self.recognize_face(
                         face.embedding, gender, age
                     )
+
                     x1, y1, x2, y2 = map(int, face.bbox)
 
                     self.update_face_info(
@@ -326,7 +465,7 @@ class CCtvMonitor:
 
                         try:
                             insertToDb(name, frame.copy(), cropped_face.copy(), face_img.copy(
-                            ), det_score, track_id, gender, age, role, path, self.quality)  # TODO
+                            ), det_score, track_id, gender, age, role, path, self.quality, region_data, self.isRelay, self.isRegionMode,self.ip_relay,self.ip_port,self.relayN1,self.relayN2)  # TODO
                         except Exception as e:
                             logging.error(f"Error inserting to DB: {e}")
                 else:
@@ -334,16 +473,12 @@ class CCtvMonitor:
                         track_id, "Unknown", 0.0, 'None', 'None', '', None
                     )
 
-
-
             except queue.Empty:
                 continue  # Timeout, check shutdown event
-            except Exception as e:
-                logging.error(f"Error in recognition worker: {e}")
 
         logging.info("Recognition worker stopped.")
 
-    async def process_frame(self, frame, path, counter):
+    async def process_frame(self, frame, path, counter, regions):
         """Process a single frame for object detection and face recognition"""
         try:
             if frame.size == 0:
@@ -352,22 +487,47 @@ class CCtvMonitor:
             start_time = time.time()
 
             # Resize frame for processing
-            # processed_frame = cv2.resize(frame, (640, 640))
-            processed_frame = frame
+            if self.isRegionMode:
+                processed_frame = cv2.resize(frame, (1000, 1000))
+            else:
+                processed_frame = frame
+            if self.isRegionMode:
+                region_masks = self.generate_region_masks(
+                    processed_frame.shape, regions)
+                combined_mask = np.zeros(
+                    processed_frame.shape[:2], dtype=np.uint8)
+                for mask in region_masks.values():
+                    combined_mask = cv2.bitwise_or(combined_mask, mask)
+                masked_frame = cv2.bitwise_and(
+                    processed_frame, processed_frame, mask=combined_mask)
+                self.k.clear()
+                current_regions = []
 
             # Run YOLO detection
             results = self.model.track(
-                processed_frame,
+                masked_frame if self.isRegionMode else processed_frame,
                 classes=[0],  # Person class
+
                 tracker="bytetrack.yaml",
                 persist=True,
                 device=self.device,
-                conf=0.7  # TODO:GET CONF IN SETTING
+                conf=self.hscore  # TODO:GET CONF IN SETTING
+                ,
+                half=True
             )
 
             if results and len(results[0].boxes) > 0:
                 for box in results[0].boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0][:4].cpu().tolist())
+                    if self.isRegionMode:
+                        region_name = self.get_detection_region(
+                            (x1, y1, x2, y2), region_masks)
+                        if region_name and region_name in regions:
+                            region_data = regions[region_name]
+                            if region_data not in current_regions:
+                                current_regions.append(region_data)
+                    else:
+                        region_data = None
 
                     # Get tracking ID
                     if box.id is None:
@@ -375,7 +535,8 @@ class CCtvMonitor:
                     track_id = int(box.id[0].cpu().item())
 
                     # Crop human region
-                    human_crop = processed_frame[y1:y2, x1:x2]
+                    human_crop = masked_frame[y1:y2,
+                                              x1:x2] if self.isRegionMode else processed_frame[y1:y2, x1:x2]
                     if human_crop.size == 0:
                         continue
 
@@ -385,10 +546,8 @@ class CCtvMonitor:
 
                     # Queue for recognition every frps frames
                     # if counter % self.frps == 0:
-                    #   stats=self.get_queue_stats()
-                    #   logging.info(f"Queue: {stats['queue_size']}, Processed: {stats['processed']}, Failed: {stats['failed']}")
                     self.recognition_queue.put(
-                        (processed_frame.copy(), path, track_id, human_crop))
+                        (processed_frame.copy(), path, track_id, human_crop, region_data))
 
                     # Get face info
                     with self.face_info_lock:
@@ -408,50 +567,18 @@ class CCtvMonitor:
                     label = f"{info['name']} ID:{track_id}"
                     face_bbox = info['bbox']
 
-                    # try:
-                    #     score = int(info['score'] *
-                    #                 100) if info['score'] else 0
-                    # except (TypeError, ValueError):
-                    #     score = 0
-
-                    # name = info['name']
-                    # gender = info['gender']
-                    # age = info['age']
-                    # role = info['role']
-
-                    # Draw face bounding box if available
                     if face_bbox:
                         fx1, fy1, fx2, fy2 = face_bbox
                         cv2.rectangle(
                             processed_frame,
                             (x1 + fx1, y1 + fy1),
                             (x1 + fx2, y1 + fy2),
-                            (0, 0, 255), 1
+                            (0, 0, 255), 2
                         )
                         cv2.putText(
                             processed_frame, label, (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2
                         )
-
-                        # Crop face with padding
-                        # height_f, width_f = human_crop.shape[:2]
-                        # padding = 40
-                        # fx1_padded = max(fx1 - padding, 0)
-                        # fy1_padded = max(fy1 - padding, 0)
-                        # fx2_padded = min(fx2 + padding, width_f)
-                        # fy2_padded = min(fy2 + padding, height_f)
-
-                        # cropped_face = human_crop[fy1_padded:fy2_padded,
-                        #                           fx1_padded:fx2_padded]
-
-                        # # Insert to database
-                        # try:
-                        #     await self.queue_db_insertion(
-                        #         name, processed_frame, cropped_face, human_crop,
-                        #         score, track_id, gender, age, role, path
-                        #     )
-                        # except Exception as e:
-                        #     logging.error(f"Error inserting to DB: {e}")
 
                     else:
                         cv2.putText(
@@ -460,13 +587,24 @@ class CCtvMonitor:
                         )
 
             # Calculate and display FPS
-            # fps = 1.0 / (time.time() - start_time)
-            # cv2.putText(
-            #     processed_frame, f"FPS: {fps:.2f}", (10, 25),
-            #     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
-            # )
+            if self.isRegionMode:
+                self.k = current_regions
+                self.onDisplay(self.k, processed_frame)
+                display_frame = self.draw_regions_on_frame(
+                    processed_frame, regions)
+            else:
+                display_frame = processed_frame
 
-            return processed_frame
+            try:
+                fps = 1.0 / (time.time() - start_time)
+            except ZeroDivisionError:
+                fps = 30
+            cv2.putText(
+                display_frame, f"FPS: {fps:.2f}", (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
+            )
+
+            return display_frame
 
         except Exception as e:
             logging.error(f"Error processing frame: {e}")
@@ -500,6 +638,32 @@ class CCtvMonitor:
         check_interval = 60  # seconds
         last_check = 0
         counter = 0
+        if self.isRegionMode:
+            regions = self.load_regions(soruce=source)
+            if regions == None:
+                regions = {"r2": {
+                    "id": "1345",
+                    "name": "r2",
+                    "description": "",
+                    "points": [
+                        [0.0, 0.0],          # top-left
+                        [999.0, 0.0],  # top-right
+                        [999.0, 999.0],  # bottom-right
+                        [0.0, 999.0],       # bottom-left
+                        [0.0, 0.0]
+                    ],
+                    "shape_type": "polygon",
+                    "color": "red",
+                    "created": "2025-08-05T11:46:12.379819",
+
+                    "ip": urlparse(source).hostname
+                }, }
+        # logging.info("Regions loaded:", list(regions.keys()))
+
+            if not hasattr(self, 'k'):
+                self.k = []
+        else:
+            regions = None
 
         def open_capture(source):
             cap = cv2.VideoCapture(source)
@@ -560,18 +724,12 @@ class CCtvMonitor:
                     )
                 else:
                     # Store original dimensions
-                    original_height, original_width = frame.shape[:2]
 
-                    # Process frame
                     if role == True:
                         frame = frame
+                    # Process frame
                     else:
-
-                        frame = await self.process_frame(frame, f'/rt{camera_idx}', counter)
-
-                    # Resize back to original dimensions
-                    frame = cv2.resize(
-                        frame, (original_width, original_height))
+                        frame = await self.process_frame(frame, f'/rt{camera_idx}', counter, regions)
 
                 # Encode and yield the frame
                 try:
@@ -602,7 +760,7 @@ def image_searcher(file_path):
         return None
 
 
-def image_crop(filepath, isSearch):  # TODO:CHANGE MODEL TO SAME AS ORIGINAL MODEL
+def image_crop(filepath, isSearch):
     """Crop face from image with padding"""
     if isSearch:
         frame = cv2.imread(filepath)
@@ -644,16 +802,8 @@ def image_crop(filepath, isSearch):  # TODO:CHANGE MODEL TO SAME AS ORIGINAL MOD
 
 
 if __name__ == "__main__":
-    a = CCtvMonitor()
-    a.recognition_worker()
-    a.generate_frames('/rt1', 'rtsp://192.168.1.10:554/stream', Request, False)
-    # a = CCtvMonitor()
-    # embeddings, filenames = a.load_embeddings()
-
-    # query_path = 'outputs/screenshot/s.unknown_29.jpg'
-    # query_embedding = a.get_embedding(query_path)
-    # results = a.find_similar_images(
-    #     query_embedding, embeddings, filenames, top_k=10)
-    # print("\nTop similar images:")
-    # for fname, score in results:
-    #     print(f"{fname}: {score:.4f}")
+    result = image_crop(r'dbimage\aref\image.png')
+    if result is not None:
+        print("Image cropped successfully")
+    else:
+        print("Failed to crop image")
