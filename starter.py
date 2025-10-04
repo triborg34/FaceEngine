@@ -32,10 +32,11 @@ def kill_pid(pid):
 
 def kill_ports():
 
-    url = 'http://127.0.0.1:8090/api/collections/setting/records'
+    url = 'http://127.0.0.1:8091/api/collections/setting/records'
     response = requests.get(url).json()
     kport=response['items'][0]['port']
-    PORTS_TO_KILL=[kport,8090]
+    print(kport)
+    PORTS_TO_KILL=[kport,8091]
     for port in PORTS_TO_KILL:
         for pid in get_pids_on_port(port):
             kill_pid(pid)

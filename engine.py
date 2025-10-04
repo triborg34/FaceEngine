@@ -51,7 +51,8 @@ class CCtvMonitor:
         self.start()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.frps = 5 if self.device == 'cuda' else 25
-        self.MODEL_PATH = os.getenv("MODEL_PATH", "models/yolov8n.pt")
+        self.fileEx='onnx' if self.chechOnnx() else 'pt'
+        self.MODEL_PATH = os.getenv("MODEL_PATH", f"models/yolov8n.{self.fileEx}")
         self.TARGET_FPS = 30
         self.FRAME_DELAY = 1.0 / self.TARGET_FPS
         self.RETRY_LIMIT = 5
@@ -97,6 +98,20 @@ class CCtvMonitor:
 
         self.loadWebBrowser(self.port)
 
+    def chechOnnx(self):
+        directory = 'models'
+        for filename in os.listdir(directory):
+    # Get full file path
+            filepath = os.path.join(directory, filename)
+            
+            # Check if it's a file (not a directory)
+            if os.path.isfile(filepath):
+                # Check if filename is exactly "onnx"
+                if filename == "onnx":
+                    logging.info(f"Found the 'onnx' file!")
+                    
+                    # Read and process the onnx file
+                    return True
     def loadWebBrowser(self, port):
         webbrowser.open(f'http://127.0.0.1:{port}/web/app')
 
@@ -295,8 +310,9 @@ class CCtvMonitor:
             self.face_handler.prepare(ctx_id=0)
 
             # Load YOLO model
-            self.model = YOLO(self.MODEL_PATH, verbose=False)
-            self.model.eval()
+            self.model = YOLO(self.MODEL_PATH, task='detect',verbose=False)
+            if self.fileEx != 'onnx':
+                self.model.eval()
 
             logging.info('Models loaded successfully.')
 
@@ -435,6 +451,7 @@ class CCtvMonitor:
                         continue
 
                 # Process face
+             
                 faces = self.face_handler.get(face_img)
 
                 if faces:
