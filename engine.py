@@ -49,7 +49,7 @@ class CCtvMonitor:
     def __init__(self):
         self.process = None
         self.start()
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device ='cuda' if torch.cuda.is_available() else 'cpu'
         self.frps = 5 if self.device == 'cuda' else 25
         self.fileEx='onnx' if self.chechOnnx() else 'pt'
         self.MODEL_PATH = os.getenv("MODEL_PATH", f"models/yolov8n.{self.fileEx}")
@@ -112,6 +112,22 @@ class CCtvMonitor:
                     
                     # Read and process the onnx file
                     return True
+        return False
+    def chechopenvivo(self):
+        directory = 'models'
+        for filename in os.listdir(directory):
+    # Get full file path
+            filepath = os.path.join(directory, filename)
+            
+            # Check if it's a file (not a directory)
+            if os.path.isfile(filepath):
+                # Check if filename is exactly "openvivo"
+                if filename == "openvino":
+                    logging.info(f"Found the 'openvivo' file!")
+                    
+                    # Read and process the onnx file
+                    return True
+        return False
     def loadWebBrowser(self, port):
         webbrowser.open(f'http://127.0.0.1:{port}/web/app')
 
@@ -310,9 +326,14 @@ class CCtvMonitor:
             self.face_handler.prepare(ctx_id=0)
 
             # Load YOLO model
-            self.model = YOLO(self.MODEL_PATH, task='detect',verbose=False)
-            if self.fileEx != 'onnx':
-                self.model.eval()
+            if self.device=='cpu' and self.chechopenvivo() :
+                logging.info('Loadin openvino')
+                self.model = YOLO('models/yolov8n_openvino_model', task='detect',verbose=False)
+            else:
+                logging.info('Loadin onnx/pt')
+                self.model = YOLO(self.MODEL_PATH, task='detect',verbose=False)
+                if self.fileEx != 'onnx':
+                    self.model.eval()
 
             logging.info('Models loaded successfully.')
 
