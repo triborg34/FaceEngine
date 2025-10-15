@@ -559,22 +559,48 @@ Instructions:
         
         if file_path:
             try:
-                # Add metadata to the data
-                data = {
+                # Create current camera data
+                current_data = {
                     'regions': self.regions,
                     'image_size': self.image.size if self.image else None,
                     'created': datetime.now().isoformat(),
                     'total_regions': len(self.regions),
                     'version': '2.0',
-                    'ip':self.tempurl
-                    
+                    'ip': self.tempurl
                 }
                 
-                with open(file_path, 'w') as f:
-                    json.dump(data, f, indent=2)
+                # Load existing data if file exists
+                existing_data = []
+                if os.path.exists(file_path):
+                    try:
+                        with open(file_path, 'r') as f:
+                            existing_data = json.load(f)
+                            # Ensure it's a list
+                            if not isinstance(existing_data, list):
+                                existing_data = [existing_data]
+                    except:
+                        existing_data = []
                 
-                self.status_var.set(f"Regions saved to {os.path.basename(file_path)}")
-                messagebox.showinfo("Success", f"Saved {len(self.regions)} regions to file")
+                # Check if IP already exists
+                ip_found = False
+                for i, entry in enumerate(existing_data):
+                    if entry.get('ip') == self.tempurl:
+                        # Update existing entry
+                        existing_data[i] = current_data
+                        ip_found = True
+                        break
+                
+                # If IP not found, append new entry
+                if not ip_found:
+                    existing_data.append(current_data)
+                
+                # Save updated data
+                with open(file_path, 'w') as f:
+                    json.dump(existing_data, f, indent=2)
+                
+                action = "Updated" if ip_found else "Added"
+                self.status_var.set(f"{action} regions for IP {self.tempurl} in {os.path.basename(file_path)}")
+                messagebox.showinfo("Success", f"{action} {len(self.regions)} regions for camera {self.tempurl}")
                 
             except Exception as e:
                 messagebox.showerror("Error", f"Could not save regions: {str(e)}")

@@ -49,17 +49,17 @@ class CCtvMonitor:
     def __init__(self):
         self.process = None
         self.start()
-        self.device ='cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.frps = 5 if self.device == 'cuda' else 25
-        self.fileEx='onnx' if self.chechOnnx() else 'pt'
-        self.MODEL_PATH = os.getenv("MODEL_PATH", f"models/yolov8n.{self.fileEx}")
+        self.fileEx = 'onnx' if self.chechOnnx() else 'pt'
+        self.MODEL_PATH = os.getenv(
+            "MODEL_PATH", f"models/yolov8n.{self.fileEx}")
         self.TARGET_FPS = 30
         self.FRAME_DELAY = 1.0 / self.TARGET_FPS
         self.RETRY_LIMIT = 5
         self.RETRY_DELAY = 3
-        self.ip_relay,self.ip_port,self.relayN1,self.relayN2='','','',''
+        self.ip_relay, self.ip_port, self.relayN1, self.relayN2 = '', '', '', ''
         self.score, self.padding, self.quality, self.hscore, self.simscore, self.port, self.isRegionMode, self.isRelay = self.loadConfig()
-        
 
         # Initialize models
         self.model = None
@@ -101,33 +101,35 @@ class CCtvMonitor:
     def chechOnnx(self):
         directory = 'models'
         for filename in os.listdir(directory):
-    # Get full file path
+            # Get full file path
             filepath = os.path.join(directory, filename)
-            
+
             # Check if it's a file (not a directory)
             if os.path.isfile(filepath):
                 # Check if filename is exactly "onnx"
                 if filename == "onnx":
                     logging.info(f"Found the 'onnx' file!")
-                    
+
                     # Read and process the onnx file
                     return True
         return False
+
     def chechopenvivo(self):
         directory = 'models'
         for filename in os.listdir(directory):
-    # Get full file path
+            # Get full file path
             filepath = os.path.join(directory, filename)
-            
+
             # Check if it's a file (not a directory)
             if os.path.isfile(filepath):
                 # Check if filename is exactly "openvivo"
                 if filename == "openvino":
                     logging.info(f"Found the 'openvivo' file!")
-                    
+
                     # Read and process the onnx file
                     return True
         return False
+
     def loadWebBrowser(self, port):
         webbrowser.open(f'http://127.0.0.1:{port}/web/app')
 
@@ -136,12 +138,12 @@ class CCtvMonitor:
         """Load regions from JSON file"""
         try:
             with open(file_path, 'r') as f:
-                data = json.load(f)
-
-                if url == data['ip']:
-                    return data.get('regions', {})
-                else:
-                    pass
+                datas = json.load(f)
+                for data in datas:
+                    if url == data['ip']:
+                        return data.get('regions', {})
+                    else:
+                        pass
 
         except Exception as e:
             print(f"Error loading regions: {e}")
@@ -252,11 +254,12 @@ class CCtvMonitor:
         response = requests.get(uri)
         data = response.json().get('items')[0]
         if data['isRfid']:
-            self.ip_relay,self.ip_port,self.relayN1,self.relayN2=data['rfidip'].strip(),data['rfidport'],data['rl1'],data['rl2']
+            self.ip_relay, self.ip_port, self.relayN1, self.relayN2 = data['rfidip'].strip(
+            ), data['rfidport'], data['rl1'], data['rl2']
         if data['rl1']:
-            self.relayN1=1
+            self.relayN1 = 1
         if data['rl2']:
-            self.relayN2=2
+            self.relayN2 = 2
         return float(data['score']), data['padding'], int(data['quality']), float(data['hscore']), float(data['simscore']), data['port'], data['isregion'], data['isRfid']
 
     def load_image_searcher_model(self):
@@ -326,12 +329,14 @@ class CCtvMonitor:
             self.face_handler.prepare(ctx_id=0)
 
             # Load YOLO model
-            if self.device=='cpu' and self.chechopenvivo() :
+            if self.device == 'cpu' and self.chechopenvivo():
                 logging.info('Loadin openvino')
-                self.model = YOLO('models/yolov8n_openvino_model', task='detect',verbose=False)
+                self.model = YOLO('models/yolov8n_openvino_model',
+                                  task='detect', verbose=False)
             else:
                 logging.info('Loadin onnx/pt')
-                self.model = YOLO(self.MODEL_PATH, task='detect',verbose=False)
+                self.model = YOLO(
+                    self.MODEL_PATH, task='detect', verbose=False)
                 if self.fileEx != 'onnx':
                     self.model.eval()
 
@@ -472,7 +477,7 @@ class CCtvMonitor:
                         continue
 
                 # Process face
-             
+
                 faces = self.face_handler.get(face_img)
 
                 if faces:
@@ -480,18 +485,19 @@ class CCtvMonitor:
                     gender = 'female' if face.gender == 0 else 'male'
                     age = face.age
                     det_score = float(face.det_score)
-                    name, sim, gender, age, role = self.recognize_face(
-                        face.embedding, gender, age
-                    )
-
-                    x1, y1, x2, y2 = map(int, face.bbox)
-
-                    self.update_face_info(
-                        track_id, name, sim, gender, age, role, (
-                            x1, y1, x2, y2)
-                    )
-                    self.embedding_cache[track_id] = face.embedding
                     if det_score > self.score:
+                        name, sim, gender, age, role = self.recognize_face(
+                            face.embedding, gender, age
+                        )
+
+                        x1, y1, x2, y2 = map(int, face.bbox)
+
+                        self.update_face_info(
+                            track_id, name, sim, gender, age, role, (
+                                x1, y1, x2, y2)
+                        )
+                        self.embedding_cache[track_id] = face.embedding
+
                         height_f, width_f = face_img.shape[:2]
                         padding = self.padding
                         fx1_padded = max(x1 - padding, 0)
@@ -504,9 +510,13 @@ class CCtvMonitor:
 
                         try:
                             insertToDb(name, frame.copy(), cropped_face.copy(), face_img.copy(
-                            ), det_score, track_id, gender, age, role, path, self.quality, region_data, self.isRelay, self.isRegionMode,self.ip_relay,self.ip_port,self.relayN1,self.relayN2)  # TODO
+                            ), det_score, track_id, gender, age, role, path, self.quality, region_data, self.isRelay, self.isRegionMode, self.ip_relay, self.ip_port, self.relayN1, self.relayN2)  # TODO
                         except Exception as e:
                             logging.error(f"Error inserting to DB: {e}")
+                    else:
+                        self.update_face_info(
+                            track_id, "Unknown", 0.0, 'None', 'None', '', None
+                        )
                 else:
                     self.update_face_info(
                         track_id, "Unknown", 0.0, 'None', 'None', '', None
