@@ -183,7 +183,7 @@ Instructions:
                 return
             
             ret, frame = cap.read()
-            frame=cv2.resize(frame,(1000,1000))
+            # frame=cv2.resize(frame,(1000,1000))
             cap.release()
             
             if ret:
@@ -221,11 +221,11 @@ Instructions:
         self.image = image.copy()
         
         # Resize image if too large
-        max_size = 1000
-        if max(image.size) > max_size:
-            ratio = max_size / max(image.size)
-            new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
-            image = image.resize(new_size, Image.Resampling.LANCZOS)
+        # max_size = 1000
+        # if max(image.size) > max_size:
+        #     ratio = max_size / max(image.size)
+        #     new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
+        #     image = image.resize(new_size, Image.Resampling.LANCZOS)
         
         self.photo = ImageTk.PhotoImage(image)
         

@@ -536,10 +536,11 @@ class CCtvMonitor:
             start_time = time.time()
 
             # Resize frame for processing
-            if self.isRegionMode:
-                processed_frame = cv2.resize(frame, (1000, 1000))
-            else:
-                processed_frame = frame
+            # if self.isRegionMode:
+            #     processed_frame = cv2.resize(frame, (1000, 1000))
+            # else:
+            #     processed_frame = frame
+            processed_frame = frame
             if self.isRegionMode:
                 region_masks = self.generate_region_masks(
                     processed_frame.shape, regions)
