@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 import sys
 import time
@@ -7,9 +8,15 @@ import cv2 as cv
 
 # also acts (partly) like a cv.VideoCapture
 class FreshestFrame(threading.Thread):
-    def __init__(self, capture, name='FreshestFrame'):
-        self.capture = capture
-        assert self.capture.isOpened()
+    def __init__(self, rtsp_url, name='FreshestFrame'):
+        # self.capture = capture
+        # assert self.capture.isOpened()
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"]="rtsp_transport;tcp"
+        os.environ['OPENCV_FFMPEG_FFMPEG_DEBUG']="1"
+        os.environ['OPENCV_FFMPEG_FFMPEG_LOGLEVEL']="48"
+        cv.setNumThreads(multiprocessing.cpu_count())
+        self.rtsp_url = rtsp_url
+        self._create_capture()
 
         # this lets the read() method block until there's a new frame
         self.cond = threading.Condition()
@@ -33,29 +40,34 @@ class FreshestFrame(threading.Thread):
     def start(self):
         self.running = True
         super().start()
+    
+    def get(self,proberty):
+        self.cap.get(proberty)
+    def _create_capture(self):
+        self.cap = cv.VideoCapture(self.rtsp_url, cv.CAP_FFMPEG)
+        self.cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
 
     def release(self, timeout=None):
         self.running = False
         self.join(timeout=timeout)
-        self.capture.release()
+        self.cap.release()
 
     def run(self):
         counter = 0
         while self.running:
-            # block for fresh frame
-            (rv, img) = self.capture.read()
-            assert rv
-            counter += 1
+            rv, img = self.cap.read()
+            if not rv:
+                print("Lost frame, reconnecting...")
+                self.cap.release()
+                time.sleep(2)
+                self._create_capture()
+                continue
 
-            # publish the frame
-            with self.cond: # lock the condition for this operation
-                self.frame = img if rv else None
+            with self.cond:
+                self.frame = img
                 self.latestnum = counter
                 self.cond.notify_all()
-
-            if self.callback:
-                self.callback(img)
-
+            counter += 1
     def read(self, wait=True, seqnumber=None, timeout=None):
         # with no arguments (wait=True), it always blocks for a fresh frame
         # with wait=False it returns the current frame immediately (polling)

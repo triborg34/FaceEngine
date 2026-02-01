@@ -534,12 +534,6 @@ class CCtvMonitor:
                 return frame
 
             start_time = time.time()
-
-            # Resize frame for processing
-            # if self.isRegionMode:
-            #     processed_frame = cv2.resize(frame, (1000, 1000))
-            # else:
-            #     processed_frame = frame
             processed_frame = frame
             if self.isRegionMode:
                 region_masks = self.generate_region_masks(
@@ -561,9 +555,9 @@ class CCtvMonitor:
                 tracker="bytetrack.yaml",
                 persist=True,
                 device=self.device,
-                conf=self.hscore  # TODO:GET CONF IN SETTING
+                conf=self.hscore  # 
                 ,
-                half=True
+
             )
 
             if results and len(results[0].boxes) > 0:
