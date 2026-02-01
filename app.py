@@ -19,7 +19,7 @@ import requests
 import uvicorn
 import multiprocessing
 # Import your improved CCtvMonitor class
-from newengine import CCtvMonitor, image_crop,CameraManager
+from engine import CCtvMonitor, image_crop,CameraManager,sendRegularFrames
 from onvifmaneger import get_rtsp_url
 from savatoDb import reciveFromUi
 
@@ -113,6 +113,12 @@ async def video_feed(
     source: str = Query(...),
     role: bool = Query(False)
 ):
+    
+    if role:
+        return StreamingResponse(
+        sendRegularFrames(source,request),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
     if source == "0":
         source = int(source)
     camera_idx = int(camera_id[2:])
