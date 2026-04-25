@@ -268,11 +268,10 @@ class CCtvMonitor:
 
 
 class CameraManager:
-    def __init__(self, source, config: CCtvMonitor,camera_id,role):
+    def __init__(self, source, config: CCtvMonitor,camera_id):
         self.source = source
         self.config = config
         self.camera_id = camera_id
-        self.role = role
 
         # ---------- STATE ----------
         self.running = False
@@ -317,7 +316,7 @@ class CameraManager:
         self.stop_event.clear()
 
         self.capture_thread = threading.Thread(
-            target=self.generate_frames, args=[self.camera_id,self.source,self.role],daemon=True
+            target=self.generate_frames, args=[self.camera_id,self.source],daemon=True
         )
         self.process_thread = threading.Thread(
             target=self.process_frame, daemon=True
@@ -331,7 +330,7 @@ class CameraManager:
         self.process_thread.start()
         self.recognition_thread.start()
         
-#TODO:FREE CPU Clude 
+
     def stop(self):
         self.running = False
         self.stop_event.set()
@@ -380,8 +379,9 @@ class CameraManager:
                 + jpeg.tobytes()
                 + b"\r\n"
             )
+    
 
-    def generate_frames(self, camera_idx, source, role):
+    def generate_frames(self, camera_idx, source):
         """Generate frames from a specific camera feed"""
         if not self.is_connection_alive(source):
             logging.warning(f"[Camera {camera_idx}] Connection not available")
@@ -442,8 +442,6 @@ class CameraManager:
                
                 
 
-                if role == True:
-                    frame = frame
                     # Process frame
                 try:
                     self.frame_queue.put_nowait((f'/rt{camera_idx}', counter, regions))
