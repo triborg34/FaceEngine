@@ -41,6 +41,14 @@ logging.basicConfig(
 
 cv2.setNumThreads(multiprocessing.cpu_count())
 
+# --- Constants ---
+FACE_CROP_PADDING = 40
+SIMILARITY_THRESHOLD = 0.7
+FACE_DETECTION_CONFIDENCE_THRESHOLD = 0.5
+RECOGNITION_UPDATE_INTERVAL = 2  # seconds
+JPEG_QUALITY = 85
+
+
 
 class CCtvMonitor:
     def __init__(self):
@@ -48,7 +56,7 @@ class CCtvMonitor:
         self.start()
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.frps = 5 if self.device == 'cuda' else 25
-        self.fileEx = 'onnx' if self.chechOnnx() else 'pt'
+        self.fileEx = 'onnx' if self.checkOnnx() else 'pt'
         self.MODEL_PATH = os.getenv(
             "MODEL_PATH", f"models/yolov8n.{self.fileEx}")
         self.TARGET_FPS = 30
@@ -63,7 +71,7 @@ class CCtvMonitor:
         self.face_handler = None
         self._load_models()
         self.known_names = self.load_db()
-        # Load database
+        self._build_embedding_index()
 
         # Threading and process management
         self.embedding_cache = {}
@@ -88,7 +96,7 @@ class CCtvMonitor:
 
         self.loadWebBrowser(self.port)
 
-    def chechOnnx(self):
+    def checkOnnx(self):
         directory = 'models'
         for filename in os.listdir(directory):
             # Get full file path
@@ -104,7 +112,7 @@ class CCtvMonitor:
                     return True
         return False
 
-    def chechopenvivo(self):
+    def checkOpenVino(self):
         directory = 'models'
         for filename in os.listdir(directory):
             # Get full file path
@@ -186,7 +194,7 @@ class CCtvMonitor:
 
     def find_similar_images(self, query_embedding, embeddings, filenames, top_k=10):
         sims = cosine_similarity([query_embedding], embeddings)[0]
-        if sims[0] > 0.7:
+        if sims[0] > SIMILARITY_THRESHOLD:
             sorted_indices = np.argsort(sims)[::-1]
             results = [(filenames[i], sims[i]) for i in sorted_indices[:top_k]]
             return results
@@ -206,7 +214,7 @@ class CCtvMonitor:
             self.face_handler.prepare(ctx_id=0)
 
             # Load YOLO model
-            if self.device == 'cpu' and self.chechopenvivo():
+            if self.device == 'cpu' and self.checkOpenVino():
                 logging.info('Loadin openvino')
                 self.model = YOLO('models/yolov8n_openvino_model',
                                   task='detect', verbose=False)
@@ -238,6 +246,31 @@ class CCtvMonitor:
         except Exception as e:
             logging.error(f"Failed to load database: {e}")
             return {}
+
+    def _build_embedding_index(self):
+        """Pre-build flat numpy matrix for fast batch cosine similarity"""
+        all_embeddings = []
+        self._embedding_labels = []  # parallel list of (name, age, gender, role)
+
+        for name, person_data in self.known_names.items():
+            age = person_data.get('age', 'None')
+            gender = person_data.get('gender', 'None')
+            role = person_data.get('role', '')
+            for emb in person_data.get('embeddings', []):
+                all_embeddings.append(emb)
+                self._embedding_labels.append((name, age, gender, role))
+
+        if all_embeddings:
+            self._embedding_matrix = np.array(all_embeddings, dtype=np.float32)
+            # Normalize all rows once
+            norms = np.linalg.norm(self._embedding_matrix, axis=1, keepdims=True)
+            norms[norms == 0] = 1
+            self._embedding_matrix = self._embedding_matrix / norms
+        else:
+            self._embedding_matrix = np.empty((0, 512), dtype=np.float32)
+            self._embedding_labels = []
+
+        logging.info(f"Embedding index built: {len(self._embedding_labels)} vectors")
 
     async def graceful_shutdown(self):
         """Gracefully shutdown the system"""
@@ -352,26 +385,22 @@ class CameraManager:
             
         
     def sendFrames(self):
-    #     encode_params = [
-    #     cv2.IMWRITE_JPEG_QUALITY, 80,  # Lower quality = faster
-    #     cv2.IMWRITE_JPEG_OPTIMIZE, 1,   # Optimize encoding
-    #     cv2.IMWRITE_JPEG_PROGRESSIVE, 0  # No progressive (faster)
-    # ]
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 70, cv2.IMWRITE_JPEG_OPTIMIZE, 0]
         last_version = -1
         while self.running:
             current_version = self.display_version
             if current_version == last_version:
-                time.sleep(0.005)  # 5ms sleep when waiting
+                time.sleep(0.003)
                 continue
             last_version = current_version
             read_idx = self.display_read_idx
             frame = self.display_buffer[read_idx]
 
             if frame is None:
-                time.sleep(0.005)
+                time.sleep(0.003)
                 continue
 
-            _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            _, jpeg = cv2.imencode(".jpg", frame, encode_params)
 
             yield (
                 b"--frame\r\n"
@@ -456,23 +485,7 @@ class CameraManager:
 
     def is_connection_alive(self, source):
         """Check if network connection to source is alive"""
-        ulr = urlparse(source).hostname
-        param = "-n" if platform.system().lower() == "windows" else "-c"
-
-        # Build the ping command
-        command = ["ping", param, "1", ulr]
-
-        try:
-            # Execute the ping command
-            result = subprocess.run(
-                command, capture_output=True, text=True, timeout=10)
-            if 'unreachable' not in result.stdout:
-                return True
-            else:
-
-                return False
-        except subprocess.TimeoutExpired:
-            return False
+        return _is_connection_alive(source)
 
     def process_frame(self):
         last_capture_version = -1
@@ -638,120 +651,104 @@ class CameraManager:
 
             except Exception as e:
                 logging.error(f"Error processing frame: {e}")
-                with self.result_lock:
-                    self.result_frame = frame
 
     def recognition_worker(self):
-        """Background worker for face recognition"""
+        """Background worker for face recognition with batch queue draining"""
         logging.info("Recognition worker started.")
 
         while not self.stop_event.is_set():
             try:
-                # Use timeout to allow checking shutdown event
                 item = self.recognition_queue.get(timeout=0.05)
                 if item is None:
                     break
 
-                path, track_id, face_img, region_data = item
-                # Skip if recently updated (performance optimization)
-                with self.face_info_lock:
-                    if (track_id in self.face_info and
-                            time.time() - self.face_info[track_id]['last_update'] < 2):
-                        continue
+                # Drain queue, keep only latest per track_id
+                latest_items = {item[1]: item}
+                while not self.recognition_queue.empty():
+                    try:
+                        next_item = self.recognition_queue.get_nowait()
+                        if next_item is None:
+                            break
+                        latest_items[next_item[1]] = next_item
+                    except queue.Empty:
+                        break
 
-                # Process face
+                for path, track_id, face_img, region_data in latest_items.values():
+                    with self.face_info_lock:
+                        if (track_id in self.face_info and
+                                time.time() - self.face_info[track_id]['last_update'] < RECOGNITION_UPDATE_INTERVAL):
+                            continue
 
-                faces = self.config.face_handler.get(face_img)
+                    faces = self.config.face_handler.get(face_img)
 
-                if faces:
-                    face = faces[0]
-                    gender = 'female' if face.gender == 0 else 'male'
-                    age = face.age
-                    det_score = float(face.det_score)
-                    if det_score > self.config.score:
-                        name, sim, gender, age, role = self.recognize_face(
-                            face.embedding, gender, age
-                        )
+                    if faces:
+                        face = faces[0]
+                        gender = 'female' if face.gender == 0 else 'male'
+                        age = face.age
+                        det_score = float(face.det_score)
+                        if det_score > self.config.score:
+                            name, sim, gender, age, role = self.recognize_face(
+                                face.embedding, gender, age
+                            )
 
-                        x1, y1, x2, y2 = map(int, face.bbox)
+                            x1, y1, x2, y2 = map(int, face.bbox)
 
-                        self.update_face_info(
-                            track_id, name, sim, gender, age, role, (
-                                x1, y1, x2, y2)
-                        )
-                        self.embedding_cache[track_id] = face.embedding
+                            self.update_face_info(
+                                track_id, name, sim, gender, age, role, (
+                                    x1, y1, x2, y2)
+                            )
+                            self.embedding_cache[track_id] = face.embedding
 
-                        height_f, width_f = face_img.shape[:2]
-                        padding = self.config.padding
-                        fx1_padded = max(x1 - padding, 0)
-                        fy1_padded = max(y1 - padding, 0)
-                        fx2_padded = min(x2 + padding, width_f)
-                        fy2_padded = min(y2 + padding, height_f)
+                            height_f, width_f = face_img.shape[:2]
+                            padding = self.config.padding
+                            fx1_padded = max(x1 - padding, 0)
+                            fy1_padded = max(y1 - padding, 0)
+                            fx2_padded = min(x2 + padding, width_f)
+                            fy2_padded = min(y2 + padding, height_f)
 
-                        cropped_face = face_img[fy1_padded:fy2_padded,
-                                                fx1_padded:fx2_padded]
+                            cropped_face = face_img[fy1_padded:fy2_padded,
+                                                    fx1_padded:fx2_padded]
 
-                        try:
-                            read_idx = self.capture_read_idx
-                            current_full_frame = self.capture_buffer[read_idx]
-                            insertToDb(name,  current_full_frame.copy() if current_full_frame is not None else None, cropped_face.copy(), face_img.copy(
-                            ), det_score, track_id, gender, age, role, path, self.config.quality, region_data, self.config.isRelay, self.config.isRegionMode, self.config.ip_relay, self.config.ip_port, self.config.relayN1, self.config.relayN2)
-                            self.processed_tracks.add(track_id)
-                        except Exception as e:
-                            logging.error(f"Error inserting to DB: {e}")
+                            try:
+                                read_idx = self.capture_read_idx
+                                current_full_frame = self.capture_buffer[read_idx]
+                                insertToDb(name, current_full_frame.copy() if current_full_frame is not None else None, cropped_face.copy(), face_img.copy(
+                                ), det_score, track_id, gender, age, role, path, self.config.quality, region_data, self.config.isRelay, self.config.isRegionMode, self.config.ip_relay, self.config.ip_port, self.config.relayN1, self.config.relayN2)
+                                self.processed_tracks.add(track_id)
+                            except Exception as e:
+                                logging.error(f"Error inserting to DB: {e}")
+                        else:
+                            self.update_face_info(
+                                track_id, "Unknown", 0.0, 'None', 'None', '', None
+                            )
                     else:
                         self.update_face_info(
                             track_id, "Unknown", 0.0, 'None', 'None', '', None
                         )
-                else:
-                    self.update_face_info(
-                        track_id, "Unknown", 0.0, 'None', 'None', '', None
-                    )
 
             except queue.Empty:
-                continue  # Timeout, check shutdown event
+                continue
         logging.info("Recognition worker stopped.")
 
     def recognize_face(self, embedding, fgender, fage):
-        """Recognize face using embedding comparison"""
-        best_match = 'unknown'
-        best_score = 0.0
-        best_age = fage
-        best_gender = fgender
-        best_role = ''
+        """Recognize face using batch vectorized cosine similarity"""
+        if self.config._embedding_matrix.shape[0] == 0:
+            return "unknown", 0.0, fgender, fage, ''
 
-        try:
-            for name, person_data in self.config.known_names.items():
+        query = embedding.astype(np.float32)
+        query_norm = np.linalg.norm(query)
+        if query_norm > 0:
+            query = query / query_norm
 
-                age = person_data['age']
-                gender = person_data['gender']
-                role = person_data['role']
-                embeds = person_data['embeddings']
+        sims = self.config._embedding_matrix @ query
+        best_idx = int(np.argmax(sims))
+        best_score = float(sims[best_idx])
 
-                for known_emb in embeds:
-                    sim = cosine_similarity([embedding], [known_emb])[0][0]
+        if best_score >= self.config.simscore:
+            name, age, gender, role = self.config._embedding_labels[best_idx]
+            return name, best_score, gender, age, role
 
-                    if sim >= self.config.simscore:
-                        best_score = sim
-                        best_match = name
-                        best_age = age
-                        best_gender = gender
-                        best_role = role
-                    #     return best_match, best_score, best_gender, best_age, best_role
-                    # else:
-                    #     return "unknown", best_score, fgender, fage, best_role
-
-            # Threshold for recognition
-            if best_match != 'unknown':
-
-                return best_match, best_score, best_gender, best_age, best_role
-            else:
-
-                return "unknown", best_score, fgender, fage, best_role
-
-        except Exception as e:
-            logging.error(f"Error in face recognition: {e}")
-            return "unknown", 0.0, fgender, fage, ""
+        return "unknown", best_score, fgender, fage, ''
 
     def update_face_info(self, track_id, name, score, gender, age, role, bbox=None):
         """Thread-safe update of face information"""
@@ -791,7 +788,7 @@ class CameraManager:
                         pass
 
         except Exception as e:
-            print(f"Error loading regions: {e}")
+            logging.error(f"Error loading regions: {e}")
             return {}
 
     def draw_regions_on_frame(self, frame, regions):
@@ -906,49 +903,56 @@ def image_searcher(file_path):
     except Exception as e:
         logging.error(f"Error in image_searcher: {e}")
         return None
-def is_connection_alive( source):
-        """Check if network connection to source is alive"""
-        ulr = urlparse(source).hostname
-        param = "-n" if platform.system().lower() == "windows" else "-c"
+def _is_connection_alive(source):
+    """Check if network connection to source is alive"""
+    hostname = urlparse(source).hostname
+    param = "-n" if platform.system().lower() == "windows" else "-c"
+    command = ["ping", param, "1", hostname]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        return 'unreachable' not in result.stdout
+    except subprocess.TimeoutExpired:
+        return False
 
-        # Build the ping command
-        command = ["ping", param, "1", ulr]
+async def sendRegularFrames(source, request):
+    if not _is_connection_alive(source):
+        logging.warning("[Camera Connection not available")
+        return
+    fresh = FreshestFrame(source)
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, 70, cv2.IMWRITE_JPEG_OPTIMIZE, 0]
+    while fresh.is_alive():
+        if await request.is_disconnected():
+            logging.info("Client disconnected, releasing camera.")
+            break
+        success, frame = fresh.read()
+        if frame is None:
+            time.sleep(0.005)
+            continue
 
-        try:
-            # Execute the ping command
-            result = subprocess.run(
-                command, capture_output=True, text=True, timeout=10)
-            if 'unreachable' not in result.stdout:
-                return True
-            else:
+        _, jpeg = cv2.imencode(".jpg", frame, encode_params)
 
-                return False
-        except subprocess.TimeoutExpired:
-            return False
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n"
+            + jpeg.tobytes()
+            + b"\r\n"
+        )
+    fresh.release()
 
-async def sendRegularFrames(source,request):
-        if not is_connection_alive(source):
-            logging.warning(f"[Camera Connection not available")
-            return
-        fresh=FreshestFrame(source)
-        while fresh.is_alive():
-            if await request.is_disconnected():
-                    logging.info("Client disconnected, releasing camera.")
-                    break
-            succsess,frame=fresh.read()
-            if frame is None:
-                time.sleep(0.005)
-                continue
+_crop_face_handler = None
 
-            _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+def _get_crop_face_handler():
+    """Get or create cached FaceAnalysis handler for image_crop"""
+    global _crop_face_handler
+    if _crop_face_handler is None:
+        _crop_face_handler = FaceAnalysis(
+            'antelopev2',
+            providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
+            root='.'
+        )
+        _crop_face_handler.prepare(ctx_id=0)
+    return _crop_face_handler
 
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n"
-                + jpeg.tobytes()
-                + b"\r\n"
-            )
-        fresh.release()
 def image_crop(filepath, isSearch):
     """Crop face from image with padding"""
     if isSearch:
@@ -956,12 +960,7 @@ def image_crop(filepath, isSearch):
         _, img_encoded = cv2.imencode(".jpg", frame)
         return img_encoded
     try:
-        face_handler = FaceAnalysis(
-            'antelopev2',
-            providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
-            root='.'
-        )
-        face_handler.prepare(ctx_id=0)
+        face_handler = _get_crop_face_handler()
 
         frame = cv2.imread(filepath)
         if frame is None:
@@ -975,11 +974,10 @@ def image_crop(filepath, isSearch):
         x1, y1, x2, y2 = map(int, facebox)
 
         height_f, width_f = frame.shape[:2]
-        padding = 40
-        x1 = max(x1 - padding, 0)
-        y1 = max(y1 - padding, 0)
-        x2 = min(x2 + padding, width_f)
-        y2 = min(y2 + padding, height_f)
+        x1 = max(x1 - FACE_CROP_PADDING, 0)
+        y1 = max(y1 - FACE_CROP_PADDING, 0)
+        x2 = min(x2 + FACE_CROP_PADDING, width_f)
+        y2 = min(y2 + FACE_CROP_PADDING, height_f)
 
         cropped_frame = frame[y1:y2, x1:x2]
         _, img_encoded = cv2.imencode(".jpg", cropped_frame)
@@ -993,9 +991,9 @@ def image_crop(filepath, isSearch):
 if __name__ == "__main__":
     result = image_crop(r'dbimage\aref\image.png')
     if result is not None:
-        print("Image cropped successfully")
+        logging.info("Image cropped successfully")
     else:
-        print("Failed to crop image")
+        logging.error("Failed to crop image")
 
 
 '''

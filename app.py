@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+os.environ['ULTRALYTICS_SKIP_REQUIREMENTS_CHECKS'] = '1'
 import shutil
 import socket
 import threading
@@ -282,7 +283,6 @@ async def upload_file(isSearch: bool, file: UploadFile = File(...)):
 
 @app.post("/insertKToDp")
 async def insert_known_person(data: KnownPersonFields):
-    print("HEREEE")
     """Insert known person data to database"""
     try:
         # Validate required fields
@@ -312,6 +312,7 @@ async def insert_known_person(data: KnownPersonFields):
         # Refresh known names in CCTV monitor
         if cctv_monitor:
             cctv_monitor.known_names = cctv_monitor.load_db()
+            cctv_monitor._build_embedding_index()
             logging.info("Known names refreshed in CCTV monitor")
 
         return {
@@ -412,8 +413,11 @@ async def get_system_status():
 
 @app.get("/util/imageSearch")
 async def querySearch(fileLocation: str):
+    """Search for similar images"""
+    if not cctv_monitor:
+        raise HTTPException(status_code=503, detail="CCTV Monitor not initialized")
 
-    print(fileLocation)
+    logging.info(f"Image search query: {fileLocation}")
     cctv_monitor.precompute_embeddings(
         cctv_monitor.load_image_searcher_model(), cctv_monitor.FOLDER_PATH)
     embeddings, filenames = cctv_monitor.load_embeddings()
