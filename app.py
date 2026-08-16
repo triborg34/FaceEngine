@@ -3,12 +3,13 @@ import asyncio
 import json
 import logging
 import os
+
+import torch
 os.environ['ULTRALYTICS_SKIP_REQUIREMENTS_CHECKS'] = '1'
 import shutil
 import socket
 import threading
 import time
-import webbrowser
 import base64
 from contextlib import asynccontextmanager
 from fastapi.staticfiles import StaticFiles
@@ -20,7 +21,7 @@ import requests
 import uvicorn
 import multiprocessing
 # Import your improved CCtvMonitor class
-from engine import CCtvMonitor, image_crop,CameraManager,sendRegularFrames
+from engine import CCtvMonitor, image_crop,CameraManager,sendRegularFrames,takeFrame
 from onvifmaneger import get_rtsp_url
 from savatoDb import reciveFromUi
 
@@ -53,6 +54,11 @@ class RelayConfig(BaseModel):
     port: int
     username: str
     password: str
+
+
+class TakePicture(BaseModel):
+    rtspUrl:str
+    camName:str
 # Global CCTV monitor instance
 
 
@@ -60,7 +66,8 @@ class RelayConfig(BaseModel):
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     global cctv_monitor
-    cctv_monitor = CCtvMonitor()
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    cctv_monitor = CCtvMonitor(device=device)
 
     # Startup
     logging.info("Starting CCTV Monitor application...")
@@ -221,6 +228,41 @@ async def get_camera_rtsp(request: RtspFields):
             status_code=500, detail=f"Failed to get RTSP URL: {str(e)}")
 
 
+
+
+@app.post('/takePicture')
+async def takePicture(request:TakePicture):
+          rtspUrl=request.rtspUrl
+          camName=request.camName
+          nowSec=int(time.time())
+          filename=f"{camName}_{nowSec}.jpg"
+          UPLOAD_DIR_VIDEO = "uploads"
+          os.makedirs(UPLOAD_DIR_VIDEO, exist_ok=True)
+          file_location=os.path.join(UPLOAD_DIR_VIDEO,filename)
+          try:
+            img_encoded=takeFrame(rtspUrl,file_location)
+            # img_encoded=None
+            if img_encoded is None:
+                # Clean up file if processing failed
+                # os.remove(file_location)
+                raise HTTPException(
+                    status_code=400, detail="No face detected in image")
+            img_base64 = base64.b64encode(img_encoded.tobytes()).decode('utf-8')
+            
+
+                
+
+            return {
+                    "success": True,
+                    "file_location": file_location,
+                    "filename": filename,
+                    "image_data": img_base64,
+                    "media_type": "image/jpeg"
+                }
+          except Exception as e:
+              logging.error(e)
+
+
 @app.post("/upload")
 async def upload_file(isSearch: bool, file: UploadFile = File(...)):
     """Upload and process image file"""
@@ -279,6 +321,10 @@ async def upload_file(isSearch: bool, file: UploadFile = File(...)):
         logging.error(f"Error processing uploaded file: {e}")
         raise HTTPException(
             status_code=500, detail=f"Error processing file: {str(e)}")
+    # finally :
+    #       if os.path.exists(file_location):
+    #                 os.remove(file_location)
+
 
 
 @app.post("/insertKToDp")
@@ -297,7 +343,8 @@ async def insert_known_person(data: KnownPersonFields):
         is_url = data.imagePath.startswith(('http://', 'https://'))
 
         logging.info(f"Inserting known person: {data.name} (URL: {is_url})")
-
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
         # Call database insertion function
         result = reciveFromUi(
             data.name,
@@ -306,14 +353,16 @@ async def insert_known_person(data: KnownPersonFields):
             data.gender,
             data.role,
             data.socialnumber,
-            is_url
+            is_url,
+            device
         )
 
         # Refresh known names in CCTV monitor
         if cctv_monitor:
             cctv_monitor.known_names = cctv_monitor.load_db()
             cctv_monitor._build_embedding_index()
-            logging.info("Known names refreshed in CCTV monitor")
+            logging.info("Known names refreshed in CCTV monitor,")
+            
 
         return {
             "success": True,
@@ -409,6 +458,16 @@ async def get_system_status():
     except Exception as e:
         logging.error(f"Error getting system status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/util/refreshDb')
+async def refreshTheDb():
+    """Refreshing the Known Face Db"""
+    if cctv_monitor:
+        cctv_monitor.known_names = cctv_monitor.load_db()
+        cctv_monitor._build_embedding_index()
+        logging.info("Known names refreshed in CCTV monitor,")
+    return 200
 
 
 @app.get("/util/imageSearch")

@@ -29,21 +29,23 @@ logging.basicConfig(
 )
 
 
-def reciveFromUi(name, imagePath, age, gender, role, socialnumber, isUrl):
+def reciveFromUi(name, imagePath, age, gender, role, socialnumber, isUrl,device):
     """
     Receive data from the UI and process it.
     """
-    face_embedder = FaceAnalysis('antelopev2', providers=[
-        'CUDAExecutionProvider', 'CPUExecutionProvider'], root='.')
+    face_embedder = FaceAnalysis('antelopev2',
+                                 
+                       providers= ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device=='cuda' else ['CPUExecutionProvider'], root='.')
     face_embedder.prepare(ctx_id=0)
     model = YOLO('models/yolov8n.pt')
+
     if isUrl:
         path = urllib.request.urlretrieve(
             imagePath, "uploads/local-filename.jpg")
         imagePath = path[0]
 
     img = cv2.imread(imagePath)
-    frame = model(img, classes=[0])[0]
+    frame = model(img, classes=[0],device=device)[0]
     if len(frame.boxes) > 0:
         x1, y1, x2, y2 = map(int, frame.boxes.xyxy[0][:4])
         img = img[y1:y2, x1:x2]
@@ -51,9 +53,10 @@ def reciveFromUi(name, imagePath, age, gender, role, socialnumber, isUrl):
         logging.error(f"Image not found at {imagePath}")
         return
     face = face_embedder.get(img)
+
     if face:
         embed = face[0].embedding
-        print(embed)
+     
 
         # Check if the person already exists
         if check_person_exists(name):
@@ -147,10 +150,12 @@ def sendToDb(embed, name, img_path, age, gender, role, socialnumber):
 
         if response.status_code == 200:
             logging.info(f" Uploaded: {name}")
+            os.remove(img_path)
 
         else:
             logging.info(f" Failed to upload {name}: {response.status_code}")
             logging.info(response.text)
+            os.remove(img_path)
     os.remove(img_path)
 
 
@@ -188,6 +193,7 @@ def load_embeddings_from_db():
             age = item.get('age')
             gender = item.get('gender')
             role = item.get('role')
+            socialnumber=item.get('socialnumber')
 
             if embedding:
                 embedding = embedding[:len(embedding) - (len(embedding) % 512)]
@@ -201,6 +207,7 @@ def load_embeddings_from_db():
                             'age': age,
                             'gender': gender,
                             'role': role,
+                            'socialnumber': socialnumber,
                             'embeddings': []
                         }
 
@@ -290,7 +297,7 @@ def should_insert(name, track_id):
     return True
 
 
-def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender, age, role, path, quality, regions, isRelay: bool, isRegionMode: bool, ip_relay, port_relay, relayn1, relayn2):
+def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender, age, role, socialnumber, path, quality, regions, isRelay: bool, isRegionMode: bool, ip_relay, port_relay, relayn1, relayn2):
     global tempTime
     url = "http://127.0.0.1:8091/api/collections/collection/records"
     timeNow = datetime.datetime.now()
@@ -333,6 +340,7 @@ def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender, age
                 'date': display_date,
                 'time': display_time,
                 'role': role,
+                'socialnumber': socialnumber,
                 "track_id": str(track_id),
                 'filename': human_loc.split('/')[2]
             })

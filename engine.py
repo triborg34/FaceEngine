@@ -51,10 +51,10 @@ JPEG_QUALITY = 85
 
 
 class CCtvMonitor:
-    def __init__(self):
+    def __init__(self,device):
         self.process = None
-        self.start()
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # self.start()
+        self.device = device
         self.frps = 5 if self.device == 'cuda' else 25
         self.fileEx = 'onnx' if self.checkOnnx() else 'pt'
         self.MODEL_PATH = os.getenv(
@@ -208,7 +208,7 @@ class CCtvMonitor:
             # Load face handler
             self.face_handler = FaceAnalysis(
                 'antelopev2',
-                providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
+                providers= ['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device=='cuda' else ['CPUExecutionProvider'],
                 root='.'
             )
             self.face_handler.prepare(ctx_id=0)
@@ -256,9 +256,10 @@ class CCtvMonitor:
             age = person_data.get('age', 'None')
             gender = person_data.get('gender', 'None')
             role = person_data.get('role', '')
+            socialnumber=person_data.get('socialnumber','')
             for emb in person_data.get('embeddings', []):
                 all_embeddings.append(emb)
-                self._embedding_labels.append((name, age, gender, role))
+                self._embedding_labels.append((name, age, gender, role, socialnumber))
 
         if all_embeddings:
             self._embedding_matrix = np.array(all_embeddings, dtype=np.float32)
@@ -597,7 +598,8 @@ class CameraManager:
                                     'bbox': None,
                                     'gender': 'None',
                                     'age': 'None',
-                                    'role': ''
+                                    'role': '',
+                                    'socialnumber': ''
                                 }
                             )
 
@@ -685,16 +687,17 @@ class CameraManager:
                         face = faces[0]
                         gender = 'female' if face.gender == 0 else 'male'
                         age = face.age
+                       
                         det_score = float(face.det_score)
                         if det_score > self.config.score:
-                            name, sim, gender, age, role = self.recognize_face(
+                            name, sim, gender, age, role ,socialnumber= self.recognize_face(
                                 face.embedding, gender, age
                             )
 
                             x1, y1, x2, y2 = map(int, face.bbox)
 
                             self.update_face_info(
-                                track_id, name, sim, gender, age, role, (
+                                track_id, name, sim, gender, age, role, socialnumber, (
                                     x1, y1, x2, y2)
                             )
                             self.embedding_cache[track_id] = face.embedding
@@ -713,17 +716,17 @@ class CameraManager:
                                 read_idx = self.capture_read_idx
                                 current_full_frame = self.capture_buffer[read_idx]
                                 insertToDb(name, current_full_frame.copy() if current_full_frame is not None else None, cropped_face.copy(), face_img.copy(
-                                ), det_score, track_id, gender, age, role, path, self.config.quality, region_data, self.config.isRelay, self.config.isRegionMode, self.config.ip_relay, self.config.ip_port, self.config.relayN1, self.config.relayN2)
+                                ), det_score, track_id, gender, age, role, socialnumber, path, self.config.quality, region_data, self.config.isRelay, self.config.isRegionMode, self.config.ip_relay, self.config.ip_port, self.config.relayN1, self.config.relayN2)
                                 self.processed_tracks.add(track_id)
                             except Exception as e:
                                 logging.error(f"Error inserting to DB: {e}")
                         else:
                             self.update_face_info(
-                                track_id, "Unknown", 0.0, 'None', 'None', '', None
+                                track_id, "Unknown", 0.0, 'None', 'None','', '', None
                             )
                     else:
                         self.update_face_info(
-                            track_id, "Unknown", 0.0, 'None', 'None', '', None
+                            track_id, "Unknown", 0.0, 'None', 'None', '','', None
                         )
 
             except queue.Empty:
@@ -733,7 +736,7 @@ class CameraManager:
     def recognize_face(self, embedding, fgender, fage):
         """Recognize face using batch vectorized cosine similarity"""
         if self.config._embedding_matrix.shape[0] == 0:
-            return "unknown", 0.0, fgender, fage, ''
+            return "unknown", 0.0, fgender, fage, '',''
 
         query = embedding.astype(np.float32)
         query_norm = np.linalg.norm(query)
@@ -745,12 +748,12 @@ class CameraManager:
         best_score = float(sims[best_idx])
 
         if best_score >= self.config.simscore:
-            name, age, gender, role = self.config._embedding_labels[best_idx]
-            return name, best_score, gender, age, role
+            name, age, gender, role, socialnumber = self.config._embedding_labels[best_idx]
+            return name, best_score, gender, age, role, socialnumber
 
-        return "unknown", best_score, fgender, fage, ''
+        return "unknown", best_score, fgender, fage, '',''
 
-    def update_face_info(self, track_id, name, score, gender, age, role, bbox=None):
+    def update_face_info(self, track_id, name, score, gender, age, role, socialnumber, bbox=None):
         """Thread-safe update of face information"""
         with self.face_info_lock:
             self.face_info[track_id] = {
@@ -760,7 +763,8 @@ class CameraManager:
                 'score': score,
                 'gender': gender,
                 'age': age,
-                'role': role
+                'role': role,
+                'socialnumber': socialnumber
             }
 
     def release_resources(self, role=False):
@@ -986,6 +990,37 @@ def image_crop(filepath, isSearch):
     except Exception as e:
         logging.error(f"Error in image_crop: {e}")
         return None
+
+
+def takeFrame(rtspurl,filename):
+    print(rtspurl)
+    try:
+        cap=cv2.VideoCapture(rtspurl)
+    except Exception as e:
+        return 
+   
+    ret,frame=cap.read()
+    if frame is None:return
+    cv2.imwrite(f'{filename}',frame)
+    face_handler = _get_crop_face_handler()
+    faces = face_handler.get(frame)
+    if not faces:
+            raise ValueError("No faces detected in image")
+    facebox = faces[0].bbox
+    x1, y1, x2, y2 = map(int, facebox)
+    
+    height_f, width_f = frame.shape[:2]
+    x1 = max(x1 - FACE_CROP_PADDING, 0)
+    y1 = max(y1 - FACE_CROP_PADDING, 0)
+    x2 = min(x2 + FACE_CROP_PADDING, width_f)
+    y2 = min(y2 + FACE_CROP_PADDING, height_f)
+    
+    cropped_frame = frame[y1:y2, x1:x2]
+    _, img_encoded = cv2.imencode(".jpg", cropped_frame)
+    return img_encoded
+    
+    
+
 
 
 if __name__ == "__main__":
