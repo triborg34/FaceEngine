@@ -1,7 +1,9 @@
 
-from asyncio import Queue
+import asyncio
+import datetime
 import gc
 import logging
+import logging.handlers
 import multiprocessing
 import os
 import platform
@@ -17,11 +19,13 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 from insightface.app import FaceAnalysis
-from sklearn.metrics.pairwise import cosine_similarity
 import torch
 from concurrent.futures import ThreadPoolExecutor
 from camera import FreshestFrame
-from savatoDb import load_embeddings_from_db, insertToDb
+from savatoDb import (
+    load_embeddings_from_db, load_person_from_db, insertToDb,
+    get_db_worker, submit_db_task,
+)
 from PIL import Image
 from torchvision.transforms import transforms
 import json
@@ -31,29 +35,80 @@ import json
 logging.getLogger('torch').setLevel(logging.ERROR)
 logging.getLogger('ultralytics').setLevel(logging.ERROR)
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='[%(asctime)s] [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler("log.txt", mode='a', encoding='utf-8'),
+        logging.handlers.RotatingFileHandler("log.txt", mode='a',
+                                             maxBytes=5 * 1024 * 1024,
+                                             backupCount=2, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 
-cv2.setNumThreads(multiprocessing.cpu_count())
+# Leave headroom for the per-camera pipeline threads instead of letting
+# every OpenCV call try to occupy all cores.
+cv2.setNumThreads(max(1, min(4, multiprocessing.cpu_count())))
 
 # --- Constants ---
 FACE_CROP_PADDING = 40
 SIMILARITY_THRESHOLD = 0.7
 FACE_DETECTION_CONFIDENCE_THRESHOLD = 0.5
 RECOGNITION_UPDATE_INTERVAL = 2  # seconds
+STALE_TRACK_TTL = 30  # seconds before state for unseen track IDs is pruned
 JPEG_QUALITY = 85
+# Faces smaller than this produce unstable ArcFace embeddings (landmark
+# alignment jitter): same person scores randomly 0.2-0.5 across scales.
+# Skip them instead of storing/embedding garbage.
+MIN_FACE_PX = int(os.getenv("MIN_FACE_PX", "64"))
+# Dedicated InsightFace sessions per camera (opt-in via env). Measured on
+# this machine: one SHARED session sustains ~88 calls/s across camera
+# threads while concurrent sessions collapse to ~9 calls/s (GPU context
+# thrashing), so the default keeps everything on the shared session.
+# Run `python benchmark.py --threads N` before enabling on other GPUs.
+MAX_FACE_SESSIONS = int(os.getenv("MAX_FACE_SESSIONS", "0"))
+PERF_LOG_INTERVAL = float(os.getenv("PERF_LOG_INTERVAL", "30"))  # seconds
 
 
+class _StageStats:
+    """Thread-safe rolling stage timings, flushed to the log periodically.
+
+    Usage: PERF_STATS.add("cam0:yolo", elapsed_seconds)
+    """
+
+    def __init__(self, log_interval=PERF_LOG_INTERVAL):
+        self.log_interval = log_interval
+        self._lock = threading.Lock()
+        self._sums = {}
+        self._counts = {}
+        self._last_log = time.time()
+
+    def add(self, stage, seconds):
+        with self._lock:
+            self._sums[stage] = self._sums.get(stage, 0.0) + seconds
+            self._counts[stage] = self._counts.get(stage, 0) + 1
+            now = time.time()
+            if now - self._last_log >= self.log_interval:
+                self._flush(now)
+
+    def _flush(self, now):
+        parts = []
+        for stage in sorted(self._sums):
+            count = max(self._counts[stage], 1)
+            total = self._sums[stage]
+            parts.append(f"{stage}: {1000*total/count:.1f}ms avg x{count}")
+        if parts:
+            logging.info("[perf] " + "; ".join(parts))
+        self._sums.clear()
+        self._counts.clear()
+        self._last_log = now
+
+
+PERF_STATS = _StageStats()
 
 class CCtvMonitor:
     def __init__(self,device):
         self.process = None
-        # self.start()
+        self.start()
         self.device = device
         self.frps = 5 if self.device == 'cuda' else 25
         self.fileEx = 'onnx' if self.checkOnnx() else 'pt'
@@ -69,12 +124,24 @@ class CCtvMonitor:
         # Initialize models
         self.model = None
         self.face_handler = None
+        # Dedicated per-camera InsightFace sessions bookkeeping
+        self._face_sessions_created = 0
+        self._face_sessions_disabled = False
+        # The shared InsightFace/YOLO sessions get serialized across threads
+        self.face_lock = threading.Lock()
+        self.model_lock = threading.Lock()
         self._load_models()
         self.known_names = self.load_db()
+
+        # Thread-safe embedding index: atomic swap via tuple assignment.
+        # The index lock serialises rebuilds while readers use the old
+        # snapshot until the new one is published.
+        self._index_lock = threading.Lock()
         self._build_embedding_index()
 
         # Threading and process management
         self.embedding_cache = {}
+        self._cache_lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=10)
         self._shutdown_event = threading.Event()
 
@@ -84,6 +151,8 @@ class CCtvMonitor:
         self.FILENAMES_FILE = "filenames.txt"  # file to save/load filenames
         self.LOCAL_WEIGHTS = "models/resnet50-0676ba61.pth"
         self.IMG_EXTENSIONS = (".jpg", ".jpeg", ".png")
+        self._image_searcher_model = None
+        self._image_searcher_lock = threading.Lock()
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
@@ -136,7 +205,7 @@ class CCtvMonitor:
             iou = file.readline()
         iou = float(iou)
         uri = 'http://127.0.0.1:8091/api/collections/setting/records'
-        response = requests.get(uri)
+        response = requests.get(uri, timeout=5)
         data = response.json().get('items')[0]
         if data['isRfid']:
             self.ip_relay, self.ip_port, self.relayN1, self.relayN2 = data['rfidip'].strip(
@@ -148,16 +217,21 @@ class CCtvMonitor:
         return float(data['score']), data['padding'], int(data['quality']), float(data['hscore']), float(data['simscore']), data['port'], data['isregion'], data['isRfid'], iou
 
     def load_image_searcher_model(self):
-        model = resnet50(weights=None)  # don't load default
-        # load weights from file
-        state_dict = torch.load(self.LOCAL_WEIGHTS, map_location=self.device)
-        model.load_state_dict(state_dict)
-        model = torch.nn.Sequential(*(list(model.children())[:-1]))
-        model.eval().to(self.device)
-        return model
+        """Load the ResNet50 search model once and cache it"""
+        if self._image_searcher_model is None:
+            with self._image_searcher_lock:
+                if self._image_searcher_model is None:
+                    model = resnet50(weights=None)  # don't load default
+                    state_dict = torch.load(
+                        self.LOCAL_WEIGHTS, map_location=self.device)
+                    model.load_state_dict(state_dict)
+                    model = torch.nn.Sequential(*(list(model.children())[:-1]))
+                    model.eval().to(self.device)
+                    self._image_searcher_model = model
+        return self._image_searcher_model
 
-    def get_embedding(self, img_path):
-        model = self.load_image_searcher_model()
+    def get_embedding(self, img_path, model=None):
+        model = model or self.load_image_searcher_model()
         img = Image.open(img_path).convert("RGB")
         img_t = self.transform(img).unsqueeze(0).to(self.device)
         with torch.no_grad():
@@ -165,24 +239,37 @@ class CCtvMonitor:
         features = features.view(features.size(0), -1).cpu().numpy().flatten()
         return features / np.linalg.norm(features)
 
-    def precompute_embeddings(self, model, folder_path):
-        logging.info("Precomputing embeddings for all images in folder...")
-        embeddings = []
-        filenames = []
-        for fname in os.listdir(folder_path):
+    def precompute_embeddings(self, model=None, folder_path=None):
+        """Incrementally embed only files missing from the saved index"""
+        model = model or self.load_image_searcher_model()
+        folder_path = folder_path or self.FOLDER_PATH
+        if os.path.exists(self.EMBEDDING_FILE) and os.path.exists(self.FILENAMES_FILE):
+            embeddings, filenames = self.load_embeddings()
+            embeddings = embeddings.tolist()
+        else:
+            embeddings, filenames = [], []
+
+        known = set(filenames)
+        new_count = 0
+        for fname in sorted(os.listdir(folder_path)):
             if not fname.lower().endswith(self.IMG_EXTENSIONS):
                 continue
-            fpath = os.path.join(folder_path, fname)
-            emb = self.get_embedding(fpath)
+            if fname in known:
+                continue
+            emb = self.get_embedding(os.path.join(folder_path, fname), model)
             embeddings.append(emb)
             filenames.append(fname)
-            logging.info(f"Processed {fname}")
+            new_count += 1
+
+        if not embeddings:
+            return np.empty((0, 2048), dtype=np.float32), []
+
         embeddings = np.array(embeddings)
         np.save(self.EMBEDDING_FILE, embeddings)
         with open(self.FILENAMES_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join(filenames))
         logging.info(
-            f"Saved embeddings to {self.EMBEDDING_FILE} and filenames to {self.FILENAMES_FILE}")
+            f"Image-search index updated: {new_count} new, {len(filenames)} total")
         return embeddings, filenames
 
     def load_embeddings(self):
@@ -193,12 +280,56 @@ class CCtvMonitor:
         return embeddings, filenames
 
     def find_similar_images(self, query_embedding, embeddings, filenames, top_k=10):
-        sims = cosine_similarity([query_embedding], embeddings)[0]
-        if sims[0] > SIMILARITY_THRESHOLD:
+        # All stored embeddings are L2-normalized at creation time
+        # (get_embedding), so cosine similarity is just the dot product.
+        sims = np.asarray(embeddings, dtype=np.float32) @ np.asarray(
+            query_embedding, dtype=np.float32)
+        if sims.size and np.max(sims) > SIMILARITY_THRESHOLD:
             sorted_indices = np.argsort(sims)[::-1]
-            results = [(filenames[i], sims[i]) for i in sorted_indices[:top_k]]
+            results = [(filenames[i], float(sims[i])) for i in sorted_indices[:top_k]]
             return results
         return []
+
+    def create_yolo_instance(self):
+        """Create a fresh YOLO instance so per-camera trackers don't share state"""
+        if self.device == 'cpu' and self.checkOpenVino():
+            logging.info('Loadin openvino')
+            return YOLO('models/yolov8n_openvino_model',
+                        task='detect', verbose=False)
+        logging.info('Loadin onnx/pt')
+        model = YOLO(self.MODEL_PATH, task='detect', verbose=False)
+        if self.fileEx != 'onnx':
+            model.eval()
+        return model
+
+    def create_face_instance(self):
+        """Create a dedicated InsightFace session for one camera thread.
+
+        Opt-in: set MAX_FACE_SESSIONS>0 to enable (benchmark.py first -
+        concurrent sessions hurt throughput on some GPUs). Returns None
+        when the cap is reached or creation failed (e.g. VRAM); callers
+        then fall back to the shared handler guarded by face_lock. A
+        failed creation disables further attempts so a full GPU doesn't
+        get hammered with retries.
+        """
+        if self._face_sessions_disabled or self._face_sessions_created >= MAX_FACE_SESSIONS:
+            return None
+        try:
+            handler = FaceAnalysis(
+                'antelopev2',
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device == 'cuda' else ['CPUExecutionProvider'],
+                root='.'
+            )
+            handler.prepare(ctx_id=0)
+            self._face_sessions_created += 1
+            logging.info(
+                f"Dedicated face session {self._face_sessions_created}/{MAX_FACE_SESSIONS} loaded")
+            return handler
+        except Exception as e:
+            self._face_sessions_disabled = True
+            logging.warning(
+                f"Could not create dedicated face session, sharing the global one: {e}")
+            return None
 
     def _load_models(self):
         """Load YOLO and face recognition models"""
@@ -213,17 +344,9 @@ class CCtvMonitor:
             )
             self.face_handler.prepare(ctx_id=0)
 
-            # Load YOLO model
-            if self.device == 'cpu' and self.checkOpenVino():
-                logging.info('Loadin openvino')
-                self.model = YOLO('models/yolov8n_openvino_model',
-                                  task='detect', verbose=False)
-            else:
-                logging.info('Loadin onnx/pt')
-                self.model = YOLO(
-                    self.MODEL_PATH, task='detect', verbose=False)
-                if self.fileEx != 'onnx':
-                    self.model.eval()
+            # Shared one-shot YOLO instance; each camera creates its own via
+            # create_yolo_instance so tracker state never mixes across cameras
+            self.model = self.create_yolo_instance()
 
             logging.info('Models loaded successfully.')
 
@@ -248,30 +371,56 @@ class CCtvMonitor:
             return {}
 
     def _build_embedding_index(self):
-        """Pre-build flat numpy matrix for fast batch cosine similarity"""
+        """Pre-build flat numpy matrix for fast batch cosine similarity.
+
+        Thread-safe: acquires _index_lock to serialise rebuilds.  The swap
+        itself is a single tuple assignment so readers always see a
+        consistent (matrix, labels) snapshot.
+        """
         all_embeddings = []
-        self._embedding_labels = []  # parallel list of (name, age, gender, role)
+        labels = []  # parallel list of (name, age, gender, role, socialnumber)
 
         for name, person_data in self.known_names.items():
             age = person_data.get('age', 'None')
             gender = person_data.get('gender', 'None')
             role = person_data.get('role', '')
-            socialnumber=person_data.get('socialnumber','')
+            socialnumber = person_data.get('socialnumber', '')
             for emb in person_data.get('embeddings', []):
                 all_embeddings.append(emb)
-                self._embedding_labels.append((name, age, gender, role, socialnumber))
+                labels.append((name, age, gender, role, socialnumber))
 
         if all_embeddings:
-            self._embedding_matrix = np.array(all_embeddings, dtype=np.float32)
+            matrix = np.array(all_embeddings, dtype=np.float32)
             # Normalize all rows once
-            norms = np.linalg.norm(self._embedding_matrix, axis=1, keepdims=True)
+            norms = np.linalg.norm(matrix, axis=1, keepdims=True)
             norms[norms == 0] = 1
-            self._embedding_matrix = self._embedding_matrix / norms
+            matrix = matrix / norms
         else:
-            self._embedding_matrix = np.empty((0, 512), dtype=np.float32)
-            self._embedding_labels = []
+            matrix = np.empty((0, 512), dtype=np.float32)
 
-        logging.info(f"Embedding index built: {len(self._embedding_labels)} vectors")
+        # Single atomic swap under lock so concurrent rebuilds (e.g. two
+        # registration API calls) don't race, while recognition threads
+        # read the tuple without locking (they see either old or new,
+        # never half-built).
+        with self._index_lock:
+            self.embedding_index = (matrix, labels)
+        logging.info(f"Embedding index built: {len(labels)} vectors")
+
+    def refresh_person(self, name):
+        """Incrementally refresh a single person instead of a full DB reload.
+
+        Avoids re-fetching up to 1000 records over HTTP on every known-person
+        insert; only the one changed record is loaded, then the in-memory
+        index is rebuilt (cheap, no network).
+        """
+        person = load_person_from_db(name)
+        if person is None:
+            logging.warning(f"refresh_person: no record found for '{name}'")
+            return
+        with self._index_lock:
+            self.known_names[name] = person[name]
+        self._build_embedding_index()
+        logging.info(f"Refreshed person '{name}' in CCTV monitor")
 
     async def graceful_shutdown(self):
         """Gracefully shutdown the system"""
@@ -318,28 +467,38 @@ class CameraManager:
         self.recognition_thread = None
         self.stop_event = threading.Event()
 
-        # ========== CHANGE 1: LOCK-FREE BUFFERS ==========
-        self.capture_buffer = [None, None]  # For raw frames from camera
-        self.display_buffer = [None, None]  # For processed frames
-        self.capture_write_idx = 0
+        # ========== TRIPLE BUFFERS ==========
+        # Writers publish immutable frames/bytes and advance the read index
+        # under a lock; readers fetch read_idx once and keep a valid reference.
+        self.capture_buffer = [None, None, None]  # raw frames from camera
+        self.display_buffer = [None, None, None]  # encoded JPEG bytes
         self.capture_read_idx = 0
-        self.display_write_idx = 0
         self.display_read_idx = 0
         
         self.capture_version = 0
         self.display_version = 0
+        self._capture_lock = threading.Lock()
+        self._display_lock = threading.Lock()
         
-        # ========== CHANGE 2: OPTIMIZED QUEUES ==========
-        # Smaller queues, faster operations
-        self.frame_queue = queue.Queue(maxsize=2)  # Was 10
-        self.recognition_queue = queue.Queue(maxsize=3)  # Was 10
+        # ========== OPTIMIZED QUEUES ==========
+        self.frame_queue = queue.Queue(maxsize=2)
+        self.recognition_queue = queue.Queue(maxsize=5)
         
         # ---------- DATA ----------
-        # Remove: self.result_frame, self.result_lock
+        self._processed_tracks_lock = threading.Lock()
         self.processed_tracks = set()
         self.face_info = {}
         self.face_info_lock = threading.Lock()
         self.embedding_cache = {}
+        self._cache_lock = threading.Lock()
+        self.last_seen = {}  # track_id -> timestamp, for pruning stale state
+        self._last_prune = 0.0
+        self._jpeg_params = [cv2.IMWRITE_JPEG_QUALITY,
+                             70, cv2.IMWRITE_JPEG_OPTIMIZE, 0]
+        self.model = None  # per-camera YOLO, created on start()
+        # Dedicated InsightFace session for this camera (falls back to the
+        # shared config.face_handler behind face_lock when None)
+        self.face_handler = None
         
         if self.config.isRegionMode:
             self.background_subtractor = cv2.createBackgroundSubtractorMOG2()
@@ -348,6 +507,15 @@ class CameraManager:
     def start(self):
         self.running = True
         self.stop_event.clear()
+
+        if self.model is None:
+            # Own YOLO instance per camera: bytetrack state must not be shared
+            self.model = self.config.create_yolo_instance()
+
+        if self.face_handler is None:
+            # Own InsightFace session per camera so recognition never queues
+            # behind other cameras' GPU work on the global face_lock
+            self.face_handler = self.config.create_face_instance()
 
         self.capture_thread = threading.Thread(
             target=self.generate_frames, args=[self.camera_id,self.source],daemon=True
@@ -383,10 +551,15 @@ class CameraManager:
             if self.client_count == 0:
                 self.stop()
 
+    def has_clients(self):
+        with self.client_lock:
+            return self.client_count > 0
+
             
         
     def sendFrames(self):
-        encode_params = [cv2.IMWRITE_JPEG_QUALITY, 70, cv2.IMWRITE_JPEG_OPTIMIZE, 0]
+        # Frames arrive pre-encoded from process_frame; every client shares
+        # the same bytes instead of encoding per client.
         last_version = -1
         while self.running:
             current_version = self.display_version
@@ -394,19 +567,16 @@ class CameraManager:
                 time.sleep(0.003)
                 continue
             last_version = current_version
-            read_idx = self.display_read_idx
-            frame = self.display_buffer[read_idx]
+            jpeg_bytes = self.display_buffer[self.display_read_idx]
 
-            if frame is None:
+            if jpeg_bytes is None:
                 time.sleep(0.003)
                 continue
-
-            _, jpeg = cv2.imencode(".jpg", frame, encode_params)
 
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n"
-                + jpeg.tobytes()
+                + jpeg_bytes
                 + b"\r\n"
             )
     
@@ -418,33 +588,11 @@ class CameraManager:
             return
 
         counter = 0
-        if self.config.isRegionMode:
-            regions = self.load_regions(soruce=source)
-            if regions == None:
-                regions = {"r2": {
-                    "id": "1345",
-                    "name": "r2",
-                    "description": "",
-                    "points": [
-                        [0.0, 0.0],          # top-left
-                        [999.0, 0.0],  # top-right
-                        [999.0, 999.0],  # bottom-right
-                        [0.0, 999.0],       # bottom-left
-                        [0.0, 0.0]
-                    ],
-                    "shape_type": "polygon",
-                    "color": "red",
-                    "created": "2025-08-05T11:46:12.379819",
-
-                    "ip": urlparse(source).hostname
-                }, }
-
-            if not hasattr(self, 'k'):
-                self.k = []
-        else:
-            regions = None
-
-       
+        region_masks = None
+        combined_mask = None
+        regions = self.load_regions(soruce=source) if self.config.isRegionMode else None
+        if self.config.isRegionMode and not hasattr(self, 'k'):
+            self.k = []
 
         fresh = FreshestFrame(source)
 
@@ -454,27 +602,35 @@ class CameraManager:
                 success, frame = fresh.read()
                 counter += 1
                 
-                # if counter%750  ==0:
-                #     print("CLEARING TRACKS")
-                #     self.processed_tracks.clear()
 
                 if frame is None:
                     continue
-                write_idx = self.capture_write_idx
-                self.capture_buffer[write_idx] = frame
-                
-                # Swap buffers atomically
-                self.capture_read_idx = write_idx
-                self.capture_write_idx = 1 - write_idx
-                self.capture_version += 1
+
+                # Region masks only depend on frame size, build them once
+                if self.config.isRegionMode and region_masks is None:
+                    # If this camera has no region defined in regions.json,
+                    # auto-create one that covers the entire frame and
+                    # persist it so it isn't recreated on every restart.
+                    if not regions:
+                        regions = self.create_default_region(source, frame.shape)
+                    region_masks = self.generate_region_masks(frame.shape, regions)
+                    combined_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+                    for mask in region_masks.values():
+                        combined_mask = cv2.bitwise_or(combined_mask, mask)
+
+                with self._capture_lock:
+                    write_idx = (self.capture_read_idx + 1) % len(self.capture_buffer)
+                    self.capture_buffer[write_idx] = frame
+                    self.capture_read_idx = write_idx
+                    self.capture_version += 1
                 
 
                
                 
 
-                    # Process frame
                 try:
-                    self.frame_queue.put_nowait((f'/rt{camera_idx}', counter, regions))
+                    self.frame_queue.put_nowait(
+                        (f'/rt{camera_idx}', counter, regions, region_masks, combined_mask))
                 except queue.Full:
                     pass
 
@@ -503,40 +659,33 @@ class CameraManager:
             if item is None:
                 logging.info("process_frame shutdown signal received")
                 break
-            path, counter, regions = item
+            path, counter, regions, region_masks, combined_mask = item
             current_capture_version = self.capture_version
-            
+
             # Skip if same frame
             if current_capture_version == last_capture_version:
                 continue
-            
+
             last_capture_version = current_capture_version
-            
+
             # Read from stable read buffer
-            read_idx = self.capture_read_idx
-            frame = self.capture_buffer[read_idx]
+            frame = self.capture_buffer[self.capture_read_idx]
             if frame is None or frame.size == 0:
                 continue
 
             try:
-        
-
-                start_time = time.time()
+                now = start_time = time.time()
                 processed_frame = frame.copy()
                 if self.config.isRegionMode:
-                    region_masks = self.generate_region_masks(
-                        processed_frame.shape, regions)
-                    combined_mask = np.zeros(
-                        processed_frame.shape[:2], dtype=np.uint8)
-                    for mask in region_masks.values():
-                        combined_mask = cv2.bitwise_or(combined_mask, mask)
+                    # Masks were built once in the capture thread
                     masked_frame = cv2.bitwise_and(
                         processed_frame, processed_frame, mask=combined_mask)
                     self.k.clear()
                     current_regions = []
 
-                # Run YOLO detection
-                results = self.config.model.track(
+                # Run YOLO detection on this camera's own instance
+                _t0 = time.perf_counter()
+                results = self.model.track(
                     masked_frame if self.config.isRegionMode else processed_frame,
                     classes=[0],  # Person class
                     iou=self.config.iou,
@@ -544,14 +693,15 @@ class CameraManager:
                     persist=True,
                     device=self.config.device,
                     conf=self.config.hscore,
-
                 )
+                PERF_STATS.add(f"cam{self.camera_id}:yolo", time.perf_counter() - _t0)
 
                 for res in results:
                     if res.boxes.id is None:
                         continue
                     for i in range(len(res.boxes.xyxy)):
                         x1, y1, x2, y2 = res.boxes.xyxy[i].int().tolist()
+                        region_data = None
                         if self.config.isRegionMode:
                             region_name = self.get_detection_region(
                                 (x1, y1, x2, y2), region_masks)
@@ -559,12 +709,10 @@ class CameraManager:
                                 region_data = regions[region_name]
                                 if region_data not in current_regions:
                                     current_regions.append(region_data)
-                        else:
-                            region_data = None
 
                         # Get tracking ID
-
                         track_id = int(res.boxes.id[i])
+                        self.last_seen[track_id] = now
 
                         # Crop human region
                         human_crop = masked_frame[y1:y2,
@@ -576,17 +724,19 @@ class CameraManager:
                         cv2.rectangle(processed_frame, (x1, y1),
                                       (x2, y2), (0, 255, 0), 2)
 
-                        # Queue for recognition every frps frames
-                        # if counter % self.frps == 0:
-                        if track_id not in self.processed_tracks:
+                        # Queue for recognition if not yet processed or
+                        # cooldown elapsed
+                        with self._processed_tracks_lock:
+                            already_processed = track_id in self.processed_tracks
+                        if not already_processed:
                             try:
-                                self.recognition_queue.put(
-                                    (         path,
-                                    track_id,
-                                    human_crop.copy(),
-                                    region_data))
+                                self.recognition_queue.put_nowait(
+                                    (path, track_id, human_crop.copy(),
+                                     region_data))
                             except queue.Full:
-                                pass
+                                logging.debug(
+                                    f"cam{self.camera_id}: recognition "
+                                    f"queue full, dropping track {track_id}")
 
                         # Get face info
                         with self.face_info_lock:
@@ -626,6 +776,10 @@ class CameraManager:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2
                             )
 
+                if now - self._last_prune > STALE_TRACK_TTL:
+                    self._prune_stale_tracks(now)
+                    self._last_prune = now
+
                 # Calculate and display FPS
                 if self.config.isRegionMode:
                     self.k = current_regions
@@ -643,20 +797,41 @@ class CameraManager:
                     display_frame, f"FPS: {fps:.2f}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
                 )
-                write_idx = self.display_write_idx
-                self.display_buffer[write_idx] = display_frame
-                
-                # Swap buffers atomically
-                self.display_read_idx = write_idx
-                self.display_write_idx = 1 - write_idx
-                self.display_version += 1
+                # Encode once here; all streaming clients share these bytes
+                _t0 = time.perf_counter()
+                _, jpeg = cv2.imencode(".jpg", display_frame, self._jpeg_params)
+                PERF_STATS.add(f"cam{self.camera_id}:jpeg_encode", time.perf_counter() - _t0)
+                with self._display_lock:
+                    write_idx = (self.display_read_idx + 1) % len(self.display_buffer)
+                    self.display_buffer[write_idx] = jpeg.tobytes()
+                    self.display_read_idx = write_idx
+                    self.display_version += 1
+                PERF_STATS.add(f"cam{self.camera_id}:frame_total", time.time() - start_time)
 
             except Exception as e:
                 logging.error(f"Error processing frame: {e}")
 
+    def _prune_stale_tracks(self, now):
+        """Drop state for track IDs that have not been seen recently"""
+        stale = [tid for tid, ts in self.last_seen.items()
+                 if now - ts > STALE_TRACK_TTL]
+        if not stale:
+            return
+        with self.face_info_lock:
+            for tid in stale:
+                self.face_info.pop(tid, None)
+        with self._processed_tracks_lock:
+            for tid in stale:
+                self.processed_tracks.discard(tid)
+        with self._cache_lock:
+            for tid in stale:
+                self.embedding_cache.pop(tid, None)
+        for tid in stale:
+            self.last_seen.pop(tid, None)
+
     def recognition_worker(self):
         """Background worker for face recognition with batch queue draining"""
-        logging.info("Recognition worker started.")
+        logging.info(f"Recognition worker started for cam{self.camera_id}")
 
         while not self.stop_event.is_set():
             try:
@@ -664,7 +839,7 @@ class CameraManager:
                 if item is None:
                     break
 
-                # Drain queue, keep only latest per track_id
+                # Drain queue, keep only latest per track_id (dedup)
                 latest_items = {item[1]: item}
                 while not self.recognition_queue.empty():
                     try:
@@ -676,15 +851,44 @@ class CameraManager:
                         break
 
                 for path, track_id, face_img, region_data in latest_items.values():
+                    # Throttle: skip if this track was recently recognised
                     with self.face_info_lock:
                         if (track_id in self.face_info and
                                 time.time() - self.face_info[track_id]['last_update'] < RECOGNITION_UPDATE_INTERVAL):
+                            PERF_STATS.add(
+                                f"cam{self.camera_id}:skip_throttled", 0.0)
                             continue
 
-                    faces = self.config.face_handler.get(face_img)
+                    _t0 = time.perf_counter()
+                    if self.face_handler is not None:
+                        # Dedicated session: no cross-camera lock needed
+                        faces = self.face_handler.get(face_img)
+                        PERF_STATS.add(
+                            f"cam{self.camera_id}:face", time.perf_counter() - _t0)
+                    else:
+                        # Shared fallback: measure lock wait separately so
+                        # [perf] logs show if contention is the bottleneck
+                        with self.config.face_lock:
+                            PERF_STATS.add(
+                                f"cam{self.camera_id}:lock_wait",
+                                time.perf_counter() - _t0)
+                            _t1 = time.perf_counter()
+                            faces = self.config.face_handler.get(face_img)
+                        PERF_STATS.add(
+                            f"cam{self.camera_id}:face", time.perf_counter() - _t1)
 
                     if faces:
                         face = faces[0]
+
+                        fx1, fy1, fx2, fy2 = map(int, face.bbox)
+                        if min(fx2 - fx1, fy2 - fy1) < MIN_FACE_PX:
+                            PERF_STATS.add(
+                                f"cam{self.camera_id}:skip_small_face", 0.0)
+                            self.update_face_info(
+                                track_id, "Unknown", 0.0, 'None', 'None', '', '', None
+                            )
+                            continue
+
                         gender = 'female' if face.gender == 0 else 'male'
                         age = face.age
                        
@@ -700,7 +904,8 @@ class CameraManager:
                                 track_id, name, sim, gender, age, role, socialnumber, (
                                     x1, y1, x2, y2)
                             )
-                            self.embedding_cache[track_id] = face.embedding
+                            with self._cache_lock:
+                                self.embedding_cache[track_id] = face.embedding
 
                             height_f, width_f = face_img.shape[:2]
                             padding = self.config.padding
@@ -715,11 +920,22 @@ class CameraManager:
                             try:
                                 read_idx = self.capture_read_idx
                                 current_full_frame = self.capture_buffer[read_idx]
-                                insertToDb(name, current_full_frame.copy() if current_full_frame is not None else None, cropped_face.copy(), face_img.copy(
-                                ), det_score, track_id, gender, age, role, socialnumber, path, self.config.quality, region_data, self.config.isRelay, self.config.isRegionMode, self.config.ip_relay, self.config.ip_port, self.config.relayN1, self.config.relayN2)
-                                self.processed_tracks.add(track_id)
+                                full_frame_copy = current_full_frame.copy() if current_full_frame is not None else None
+                                # DB insert submitted to the dedicated DbWorker
+                                # so it never blocks the recognition or video
+                                # pipeline even if PocketBase is slow.
+                                submit_db_task(
+                                    insertToDb, name, full_frame_copy,
+                                    cropped_face, face_img, det_score,
+                                    track_id, gender, age, role, socialnumber, path,
+                                    self.config.quality, region_data,
+                                    self.config.isRelay, self.config.isRegionMode,
+                                    self.config.ip_relay, self.config.ip_port,
+                                    self.config.relayN1, self.config.relayN2)
+                                with self._processed_tracks_lock:
+                                    self.processed_tracks.add(track_id)
                             except Exception as e:
-                                logging.error(f"Error inserting to DB: {e}")
+                                logging.error(f"Error queueing DB insert: {e}")
                         else:
                             self.update_face_info(
                                 track_id, "Unknown", 0.0, 'None', 'None','', '', None
@@ -731,27 +947,44 @@ class CameraManager:
 
             except queue.Empty:
                 continue
-        logging.info("Recognition worker stopped.")
+        logging.info(f"Recognition worker stopped for cam{self.camera_id}")
 
     def recognize_face(self, embedding, fgender, fage):
-        """Recognize face using batch vectorized cosine similarity"""
-        if self.config._embedding_matrix.shape[0] == 0:
-            return "unknown", 0.0, fgender, fage, '',''
+        """Recognize face using batch vectorized cosine similarity.
+
+        The embedding_index is an atomic tuple (matrix, labels) swap;
+        readers never need a lock because Python's GIL guarantees atomic
+        tuple reads, and writers publish a complete new tuple.
+
+        Uses ``max()`` aggregation across all reference embeddings per
+        person so multiple reference images improve recognition.
+        """
+        # Single tuple read = atomic snapshot of matrix + labels
+        matrix, labels = self.config.embedding_index
+        if matrix.shape[0] == 0:
+            return "unknown", 0.0, fgender, fage, '', ''
 
         query = embedding.astype(np.float32)
         query_norm = np.linalg.norm(query)
         if query_norm > 0:
             query = query / query_norm
 
-        sims = self.config._embedding_matrix @ query
-        best_idx = int(np.argmax(sims))
-        best_score = float(sims[best_idx])
+        sims = matrix @ query
 
-        if best_score >= self.config.simscore:
-            name, age, gender, role, socialnumber = self.config._embedding_labels[best_idx]
-            return name, best_score, gender, age, role, socialnumber
+        # Aggregate by person: max similarity across all their embeddings
+        best_sim = -1.0
+        best_label = None
+        for i, sim_val in enumerate(sims):
+            s = float(sim_val)
+            if s > best_sim:
+                best_sim = s
+                best_label = labels[i]
 
-        return "unknown", best_score, fgender, fage, '',''
+        if best_sim >= self.config.simscore and best_label is not None:
+            name, age, gender, role, socialnumber = best_label
+            return name, best_sim, gender, age, role, socialnumber
+
+        return "unknown", max(best_sim, 0.0), fgender, fage, '', ''
 
     def update_face_info(self, track_id, name, score, gender, age, role, socialnumber, bbox=None):
         """Thread-safe update of face information"""
@@ -768,16 +1001,11 @@ class CameraManager:
             }
 
     def release_resources(self, role=False):
-        # if fresh is not None:
-        #     fresh.release()
         if not self.running:
             return
 
         self.running = False
         logging.info("Camera pipeline stopped")
-
-        # except Exception as e:
-        #     logging.error(f"Error releasing camera resources: {e}")
 
     def load_regions(self, soruce, file_path='regions.json',):
         url = urlparse(soruce).hostname
@@ -794,6 +1022,57 @@ class CameraManager:
         except Exception as e:
             logging.error(f"Error loading regions: {e}")
             return {}
+
+    def create_default_region(self, source, frame_shape, file_path='regions.json'):
+        """Create (and persist) a region covering the entire frame."""
+        h, w = frame_shape[:2]
+        region = {
+            "auto": {
+                "id": "auto",
+                "name": "auto",
+                "description": "Auto-created full-screen region",
+                "points": [
+                    [0.0, 0.0],
+                    [float(w), 0.0],
+                    [float(w), float(h)],
+                    [0.0, float(h)],
+                    [0.0, 0.0]
+                ],
+                "shape_type": "polygon",
+                "color": "red",
+                "created": datetime.datetime.now().isoformat(),
+                "ip": urlparse(source).hostname,
+                "relay_ip": None,
+                "relay_number": None
+            }
+        }
+        self.save_regions(source, region, file_path)
+        return region
+
+    def save_regions(self, source, new_regions, file_path='regions.json'):
+        """Persist regions for a camera into regions.json (merged by IP)."""
+        url = urlparse(source).hostname
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, 'r') as f:
+                    datas = json.load(f)
+            else:
+                datas = []
+
+            found = False
+            for data in datas:
+                if data.get('ip') == url:
+                    data.setdefault('regions', {}).update(new_regions)
+                    found = True
+                    break
+            if not found:
+                datas.append({'ip': url, 'regions': dict(new_regions)})
+
+            with open(file_path, 'w') as f:
+                json.dump(datas, f, indent=2)
+            logging.info(f"Auto-added region for camera {url}")
+        except Exception as e:
+            logging.error(f"Error saving regions for {url}: {e}")
 
     def draw_regions_on_frame(self, frame, regions):
         """Draw region boundaries on frame"""
@@ -831,14 +1110,9 @@ class CameraManager:
                 center_x = int(sum(p[0] for p in points) / len(points))
                 center_y = int(sum(p[1] for p in points) / len(points))
 
-                # Add background for text
                 text = f"{region_name} (ID: {region_data.get('id', 'N/A')})"
                 text_size = cv2.getTextSize(
                     text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-                # cv2.rectangle(overlay, (center_x - text_size[0]//2 - 5, center_y - text_size[1] - 5),
-                #               (center_x + text_size[0]//2 + 5, center_y + 5), (0, 0, 0), -1)
-                # cv2.putText(overlay, text, (center_x - text_size[0]//2, center_y),
-                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
         return overlay
 
@@ -896,17 +1170,6 @@ class CameraManager:
                             cv2.FONT_HERSHEY_COMPLEX_SMALL, 1, (255, 255, 255))
 
 
-def image_searcher(file_path):
-    """Load and encode image for searching"""
-    try:
-        frame = cv2.imread(file_path)
-        if frame is None:
-            raise ValueError(f"Could not load image: {file_path}")
-        _, img_encoded = cv2.imencode(".jpg", frame)
-        return img_encoded
-    except Exception as e:
-        logging.error(f"Error in image_searcher: {e}")
-        return None
 def _is_connection_alive(source):
     """Check if network connection to source is alive"""
     hostname = urlparse(source).hostname
@@ -919,42 +1182,51 @@ def _is_connection_alive(source):
         return False
 
 async def sendRegularFrames(source, request):
-    if not _is_connection_alive(source):
+    # Blocking capture/encode work is pushed to threads so the event loop
+    # (and every other stream/request) keeps running.
+    loop = asyncio.get_running_loop()
+    if not await loop.run_in_executor(None, _is_connection_alive, source):
         logging.warning("[Camera Connection not available")
         return
     fresh = FreshestFrame(source)
     encode_params = [cv2.IMWRITE_JPEG_QUALITY, 70, cv2.IMWRITE_JPEG_OPTIMIZE, 0]
-    while fresh.is_alive():
-        if await request.is_disconnected():
-            logging.info("Client disconnected, releasing camera.")
-            break
-        success, frame = fresh.read()
-        if frame is None:
-            time.sleep(0.005)
-            continue
+    try:
+        while fresh.is_alive():
+            if await request.is_disconnected():
+                logging.info("Client disconnected, releasing camera.")
+                break
+            _, frame = await loop.run_in_executor(None, fresh.read)
+            if frame is None:
+                await asyncio.sleep(0.005)
+                continue
 
-        _, jpeg = cv2.imencode(".jpg", frame, encode_params)
+            _, jpeg = await loop.run_in_executor(
+                None, lambda f=frame: cv2.imencode(".jpg", f, encode_params))
 
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n"
-            + jpeg.tobytes()
-            + b"\r\n"
-        )
-    fresh.release()
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n"
+                + jpeg.tobytes()
+                + b"\r\n"
+            )
+    finally:
+        fresh.release()
 
 _crop_face_handler = None
+_crop_face_lock = threading.Lock()
 
 def _get_crop_face_handler():
     """Get or create cached FaceAnalysis handler for image_crop"""
     global _crop_face_handler
     if _crop_face_handler is None:
-        _crop_face_handler = FaceAnalysis(
-            'antelopev2',
-            providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
-            root='.'
-        )
-        _crop_face_handler.prepare(ctx_id=0)
+        with _crop_face_lock:
+            if _crop_face_handler is None:
+                _crop_face_handler = FaceAnalysis(
+                    'antelopev2',
+                    providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
+                    root='.'
+                )
+                _crop_face_handler.prepare(ctx_id=0)
     return _crop_face_handler
 
 def image_crop(filepath, isSearch):
@@ -970,7 +1242,8 @@ def image_crop(filepath, isSearch):
         if frame is None:
             raise ValueError(f"Could not load image: {filepath}")
 
-        faces = face_handler.get(frame)
+        with _crop_face_lock:
+            faces = face_handler.get(frame)
         if not faces:
             raise ValueError("No faces detected in image")
 
@@ -992,33 +1265,29 @@ def image_crop(filepath, isSearch):
         return None
 
 
-def takeFrame(rtspurl,filename):
-    print(rtspurl)
-    try:
-        cap=cv2.VideoCapture(rtspurl)
-    except Exception as e:
-        return 
+def takeFrame(rtspurl, filename):
+    """Capture a single frame from an RTSP stream.
+
+    Returns (full_frame_encoded, file_location) on success, where
+    full_frame_encoded is the JPEG-encoded full frame (not cropped).
+    Returns None on failure.
+    """
    
-    ret,frame=cap.read()
-    if frame is None:return
-    cv2.imwrite(f'{filename}',frame)
-    face_handler = _get_crop_face_handler()
-    faces = face_handler.get(frame)
-    if not faces:
-            raise ValueError("No faces detected in image")
-    facebox = faces[0].bbox
-    x1, y1, x2, y2 = map(int, facebox)
-    
-    height_f, width_f = frame.shape[:2]
-    x1 = max(x1 - FACE_CROP_PADDING, 0)
-    y1 = max(y1 - FACE_CROP_PADDING, 0)
-    x2 = min(x2 + FACE_CROP_PADDING, width_f)
-    y2 = min(y2 + FACE_CROP_PADDING, height_f)
-    
-    cropped_frame = frame[y1:y2, x1:x2]
-    _, img_encoded = cv2.imencode(".jpg", cropped_frame)
-    return img_encoded
-    
+    cap = cv2.VideoCapture()
+    # Best-effort timeouts so a dead RTSP host can't hang the request
+    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+    cap.open(rtspurl, cv2.CAP_FFMPEG)
+    try:
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            return None
+        cv2.imwrite(filename, frame)
+        # Return the full frame encoded (for face selection UI)
+        _, full_encoded = cv2.imencode(".jpg", frame)
+        return full_encoded
+    finally:
+        cap.release()
     
 
 
@@ -1029,40 +1298,3 @@ if __name__ == "__main__":
         logging.info("Image cropped successfully")
     else:
         logging.error("Failed to crop image")
-
-
-'''
-
-## **What Changed**
-
-1. **Separate buffers for capture and display:**
-   - `capture_buffer[2]` - Raw frames from camera
-   - `display_buffer[2]` - Processed frames with detections
-
-2. **Proper read/write index separation:**
-   - Each buffer has its own `write_idx` and `read_idx`
-   - Writer updates write buffer, then swaps indices
-   - Reader always reads from stable read buffer
-
-3. **Version counters:**
-   - Detect when new frames are available
-   - Prevent processing same frame multiple times
-
-## **How It Works**
-```
-Camera Thread:
-  [Capture Frame] → write to capture_buffer[write_idx]
-                 → swap: read_idx = write_idx, write_idx = 1-write_idx
-                 → increment capture_version
-
-Process Thread:
-  Read from capture_buffer[read_idx] ← STABLE, won't change mid-read
-  [Process Frame] → write to display_buffer[write_idx]
-                  → swap: read_idx = write_idx, write_idx = 1-write_idx
-                  → increment display_version
-
-Send Thread:
-  Read from display_buffer[read_idx] ← STABLE, won't change mid-read
-  [Encode & Send]
-  
-'''

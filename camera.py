@@ -14,7 +14,8 @@ class FreshestFrame(threading.Thread):
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"]="rtsp_transport;tcp"
         os.environ['OPENCV_FFMPEG_FFMPEG_DEBUG']="1"
         os.environ['OPENCV_FFMPEG_FFMPEG_LOGLEVEL']="48"
-        cv.setNumThreads(multiprocessing.cpu_count())
+        # Keep headroom for the per-camera pipeline threads
+        cv.setNumThreads(max(1, min(4, multiprocessing.cpu_count())))
         self.rtsp_url = rtsp_url
         self._create_capture()
 
