@@ -1025,7 +1025,9 @@ async def delete_known_person(person_name: str):
         ok = delete_person_from_db(person_name)
 
         if ok and cctv_monitor:
-            cctv_monitor.refresh_person(person_name)
+            # Evict from the in-memory index immediately; refresh_person
+            # would no-op here because the DB record is already gone.
+            cctv_monitor.remove_person(person_name)
 
         return {
             "success": ok,

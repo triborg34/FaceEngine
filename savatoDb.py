@@ -164,6 +164,71 @@ def submit_db_task(fn, *args, **kwargs) -> bool:
 #  Registration pipeline: clean, reusable functions
 # ---------------------------------------------------------------------------
 
+def parse_embeddings_field(value) -> list:
+    """Parse the ``embdanings`` DB field into a list of 512-d vectors.
+
+    Handles every representation seen in the wild:
+
+    * ``None`` / empty -> ``[]``
+    * JSON string (e.g. ``"[[...512...], [...]]"`` or flat ``"[..]"``)
+      -> ``json.loads`` first
+    * list of lists (multi-embedding) -> as-is
+    * flat list of floats (single embedding) -> wrapped
+
+    Invalid entries are skipped (with a warning) instead of dropping the
+    whole person.  Previously the loaders assumed a list while
+    add/remove assumed a string, so one of the two paths silently failed
+    depending on the actual PocketBase field type.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return []
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            logging.warning("parse_embeddings_field: not valid JSON, skipped")
+            return []
+    if not isinstance(value, list) or len(value) == 0:
+        return []
+    try:
+        return safe_reshape(value)
+    except (ValueError, TypeError, IndexError) as e:
+        logging.warning(f"parse_embeddings_field: {e}")
+        return []
+
+
+def select_primary_face(faces):
+    """Return the largest face by bounding-box area.
+
+    ``faces[0]`` is NOT guaranteed to be the main subject; in a crop with
+    several people it may be a background face.  Largest-area is the most
+    reliable heuristic for "the person this photo is about".
+    """
+    if not faces:
+        return None
+    if len(faces) == 1:
+        return faces[0]
+    def _area(f):
+        x1, y1, x2, y2 = f.bbox
+        return max(x2 - x1, 0) * max(y2 - y1, 0)
+    return max(faces, key=_area)
+
+
+def face_blur_score(face_crop_bgr) -> float:
+    """Sharpness of a face crop via variance of the Laplacian.
+
+    Higher = sharper.  Sharp portraits are typically >100; heavy blur /
+    motion-blur CCTV frames are often <30.
+    """
+    if face_crop_bgr is None or face_crop_bgr.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(face_crop_bgr, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
 def extract_face_embedding(image_path: str, face_embedder, face_lock=None,
                            model=None, model_lock=None, device: str = 'cpu',
                            min_face_px: int = 64) -> Optional[np.ndarray]:
@@ -192,13 +257,34 @@ def extract_face_embedding(image_path: str, face_embedder, face_lock=None,
         logging.warning(f"extract_face_embedding: no face detected in '{image_path}'")
         return None
 
-    face = faces[0]
+    if len(faces) > 1:
+        logging.debug(
+            f"extract_face_embedding: {len(faces)} faces in '{image_path}', "
+            f"selecting largest")
+    face = select_primary_face(faces)
     fx1, fy1, fx2, fy2 = map(int, face.bbox)
     if min(fx2 - fx1, fy2 - fy1) < min_face_px:
         logging.warning(
             f"extract_face_embedding: face too small "
             f"({fx2 - fx1}x{fy2 - fy1}px, need >={min_face_px}px) "
             f"in '{image_path}'")
+        return None
+
+    # Quality gate: reject extremely blurry reference faces so one bad
+    # photo can't poison the person's embedding set.  Threshold is
+    # intentionally lenient (env MIN_FACE_BLUR, default 10.0).
+    h, w = img.shape[:2]
+    crop = img[max(fy1, 0):min(fy2, h), max(fx1, 0):min(fx2, w)]
+    blur = face_blur_score(crop)
+    min_blur = float(os.getenv("MIN_FACE_BLUR", "10.0"))
+    det = float(getattr(face, "det_score", 0.0) or 0.0)
+    logging.debug(
+        f"extract_face_embedding: '{image_path}' face {fx2 - fx1}x{fy2 - fy1}px "
+        f"det={det:.3f} blur={blur:.1f}")
+    if blur < min_blur:
+        logging.warning(
+            f"extract_face_embedding: rejecting blurry face "
+            f"(blur={blur:.1f} < {min_blur}) in '{image_path}'")
         return None
 
     return face.embedding
@@ -249,7 +335,7 @@ def _crop_face(img, face_handler, face_lock,
     if not faces:
         return None
 
-    face = faces[0]
+    face = select_primary_face(faces)
     fx1, fy1, fx2, fy2 = map(int, face.bbox)
     h, w = img.shape[:2]
     pad = FACE_CROP_PADDING
@@ -301,13 +387,19 @@ def generate_face_crop_file(image_path: str, face_handler, face_lock,
 # ---------------------------------------------------------------------------
 
 def find_person_record(name: str) -> Optional[dict]:
-    """Return the first known_face record for *name*, or None."""
-    url = (
-        f"http://127.0.0.1:8091/api/collections/known_face/records"
-        f"?filter=name=%22{name}%22"
-    )
+    """Return the first known_face record for *name*, or None.
+
+    The filter is passed via ``params`` so names with spaces or special
+    characters are URL-encoded correctly.  (The old inline ``?filter=``
+    string broke for names like "John Doe", which made lookups return
+    None -> duplicate records were created and refresh_person() could
+    never find the new person until a full restart.)
+    """
+    url = "http://127.0.0.1:8091/api/collections/known_face/records"
+    safe_name = name.replace('"', '')
     try:
-        response = _session.get(url, timeout=5)
+        response = _session.get(
+            url, params={"filter": f'name = "{safe_name}"'}, timeout=5)
     except requests.RequestException as e:
         logging.error(f"find_person_record: failed to check {name}: {e}")
         return None
@@ -468,28 +560,16 @@ def add_embedding_to_person(name: str, new_embedding: np.ndarray,
             face_crop_b64=face_crop_b64, face_crop_path=face_crop_path,
             userwhom=userwhom, description=description)
 
-    # Parse existing embeddings
-    existing_emb_str = record.get("embdanings", "")
+    # Parse existing embeddings (handles both JSON-string and
+    # native-list field representations)
     existing_embeddings: list[np.ndarray] = []
-    if existing_emb_str:
+    for e in parse_embeddings_field(record.get("embdanings", "")):
         try:
-            emb_list = json.loads(existing_emb_str)
-            if isinstance(emb_list, list) and len(emb_list) > 0:
-                if isinstance(emb_list[0], list):
-                    # Multiple embeddings stored as list of lists
-                    for e in emb_list:
-                        arr = np.array(e, dtype=np.float32)
-                        if arr.shape[0] == 512:
-                            existing_embeddings.append(arr)
-                elif isinstance(emb_list[0], (int, float)):
-                    # Single embedding stored as flat list
-                    arr = np.array(emb_list, dtype=np.float32)
-                    if arr.shape[0] == 512:
-                        existing_embeddings.append(arr)
-        except (json.JSONDecodeError, ValueError) as e:
-            logging.error(
-                f"add_embedding_to_person: failed to parse embeddings "
-                f"for '{name}': {e}")
+            arr = np.array(e, dtype=np.float32)
+        except (ValueError, TypeError):
+            continue
+        if arr.shape == (512,):
+            existing_embeddings.append(arr)
 
     # Check for duplicate (cosine similarity > 0.99)
     new_emb_norm = new_embedding.astype(np.float32)
@@ -530,23 +610,14 @@ def remove_person_embedding(name: str, embedding_index: int) -> bool:
         logging.error(f"remove_person_embedding: '{name}' not found")
         return False
 
-    existing_emb_str = record.get("embdanings", "")
     existing_embeddings: list[np.ndarray] = []
-    if existing_emb_str:
+    for e in parse_embeddings_field(record.get("embdanings", "")):
         try:
-            emb_list = json.loads(existing_emb_str)
-            if isinstance(emb_list, list) and len(emb_list) > 0:
-                if isinstance(emb_list[0], list):
-                    for e in emb_list:
-                        arr = np.array(e, dtype=np.float32)
-                        if arr.shape[0] == 512:
-                            existing_embeddings.append(arr)
-                elif isinstance(emb_list[0], (int, float)):
-                    arr = np.array(emb_list, dtype=np.float32)
-                    if arr.shape[0] == 512:
-                        existing_embeddings.append(arr)
-        except (json.JSONDecodeError, ValueError):
-            pass
+            arr = np.array(e, dtype=np.float32)
+        except (ValueError, TypeError):
+            continue
+        if arr.shape == (512,):
+            existing_embeddings.append(arr)
 
     if embedding_index < 0 or embedding_index >= len(existing_embeddings):
         logging.error(
@@ -670,36 +741,27 @@ def reciveFromUi(name, imagePath, age, gender, role, socialnumber, isUrl, device
             imagePath, "uploads/local-filename.jpg")
         imagePath = path[0]
 
-    img = cv2.imread(imagePath)
-    if img is None:
+    if cv2.imread(imagePath) is None:
         logging.error(f"Image not found at {imagePath}")
         return
 
-    if model is not None:
-        with (model_lock if model_lock is not None else nullcontext()):
-            frame = model(img, classes=[0], device=device)[0]
-        if len(frame.boxes) > 0:
-            x1, y1, x2, y2 = map(int, frame.boxes.xyxy[0][:4])
-            img = img[y1:y2, x1:x2]
+    # Single shared detection path: largest face + size/blur quality gate
+    # (see extract_face_embedding).  imagePath must still exist on disk
+    # because add_embedding_to_person re-reads it for the face crop.
+    embed = extract_face_embedding(
+        imagePath, face_embedder, face_lock, model, model_lock,
+        device, min_face_px)
+    if embed is None:
+        raise ValueError(
+            f"No usable face in '{imagePath}'. Register people from "
+            f"closer/higher-resolution, sharp, front-facing photos.")
 
-    with (face_lock if face_lock is not None else nullcontext()):
-        face = face_embedder.get(img)
-
-    if face:
-        fx1, fy1, fx2, fy2 = map(int, face[0].bbox)
-        if min(fx2 - fx1, fy2 - fy1) < min_face_px:
-            raise ValueError(
-                f"Face too small ({fx2 - fx1}x{fy2 - fy1}px, "
-                f"need >={min_face_px}px) in '{imagePath}'. "
-                f"Register people from closer/higher-resolution photos.")
-
-        embed = face[0].embedding
-        add_embedding_to_person(
-            name, embed, imagePath, age, gender, role, socialnumber,
-            userwhom=userwhom, description=description,
-            face_handler=face_embedder, face_lock=face_lock,
-            model=model, model_lock=model_lock, device=device)
-        return name
+    add_embedding_to_person(
+        name, embed, imagePath, age, gender, role, socialnumber,
+        userwhom=userwhom, description=description,
+        face_handler=face_embedder, face_lock=face_lock,
+        model=model, model_lock=model_lock, device=device)
+    return name
 
 
 def reciveFromUi_multi(name: str, image_paths: list[str], age: str,
@@ -774,9 +836,15 @@ def reciveFromUi_multi(name: str, image_paths: list[str], age: str,
 # ---------------------------------------------------------------------------
 
 def safe_reshape(embedding, dim=512):
-    """Reshape a flat embedding list into a nested list of vectors."""
-    if isinstance(embedding[0], list) and len(embedding[0]) == dim:
-        return embedding
+    """Reshape a flat embedding list into a nested list of vectors.
+
+    Nested input is filtered per-entry: only well-formed ``dim``-vectors
+    are kept, so one corrupt reference can't poison the whole person.
+    """
+    if (isinstance(embedding, list) and len(embedding) > 0
+            and isinstance(embedding[0], list)):
+        return [e for e in embedding
+                if isinstance(e, list) and len(e) == dim]
 
     if len(embedding) % dim != 0:
         raise ValueError(
@@ -802,34 +870,34 @@ def load_embeddings_from_db() -> dict:
 
         for item in records:
             name = item["name"]
-            embedding = item.get("embdanings")
             age = item.get('age')
             gender = item.get('gender')
             role = item.get('role')
             socialnumber = item.get('socialnumber')
 
-            if embedding:
-                embedding = embedding[:len(embedding) - (len(embedding) % 512)]
+            reshaped = parse_embeddings_field(item.get("embdanings"))
+            if not reshaped:
+                logging.warning(
+                    f"load_embeddings_from_db: no valid embeddings "
+                    f"for '{name}', skipped")
+                continue
+
+            if name not in known_names:
+                known_names[name] = {
+                    'age': age,
+                    'gender': gender,
+                    'role': role,
+                    'socialnumber': socialnumber,
+                    'embeddings': []
+                }
+
+            for emb in reshaped:
                 try:
-                    reshaped = safe_reshape(embedding)
-
-                    if name not in known_names:
-                        known_names[name] = {
-                            'age': age,
-                            'gender': gender,
-                            'role': role,
-                            'socialnumber': socialnumber,
-                            'embeddings': []
-                        }
-
-                    for emb in reshaped:
-                        emb_array = np.array(emb, dtype=np.float32)
-                        known_names[name]['embeddings'].append(emb_array)
-
-                except Exception as reshape_error:
-                    logging.error(
-                        f"Error reshaping embedding for {name}: "
-                        f"{reshape_error}")
+                    emb_array = np.array(emb, dtype=np.float32)
+                except (ValueError, TypeError):
+                    continue
+                if emb_array.shape == (512,):
+                    known_names[name]['embeddings'].append(emb_array)
 
         total_embeddings = sum(
             len(person['embeddings']) for person in known_names.values())
@@ -853,22 +921,19 @@ def load_person_from_db(name: str) -> Optional[dict]:
     gender = record.get('gender')
     role = record.get('role')
     socialnumber = record.get('socialnumber')
-    embedding = record.get("embdanings")
 
-    if not embedding:
-        return {name: {
-            'age': age, 'gender': gender, 'role': role,
-            'socialnumber': socialnumber, 'embeddings': []
-        }}
-
-    embedding = embedding[:len(embedding) - (len(embedding) % 512)]
-    try:
-        reshaped = safe_reshape(embedding)
-    except Exception as reshape_error:
-        logging.error(f"Error reshaping embedding for {name}: {reshape_error}")
-        return None
-
-    embeddings = [np.array(emb, dtype=np.float32) for emb in reshaped]
+    reshaped = parse_embeddings_field(record.get("embdanings"))
+    embeddings = []
+    for emb in reshaped:
+        try:
+            arr = np.array(emb, dtype=np.float32)
+        except (ValueError, TypeError):
+            continue
+        if arr.shape == (512,):
+            embeddings.append(arr)
+    if not embeddings:
+        logging.warning(
+            f"load_person_from_db: no valid embeddings for '{name}'")
     return {name: {
         'age': age, 'gender': gender, 'role': role,
         'socialnumber': socialnumber, 'embeddings': embeddings

@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from camera import FreshestFrame
 from savatoDb import (
     load_embeddings_from_db, load_person_from_db, insertToDb,
-    get_db_worker, submit_db_task,
+    get_db_worker, submit_db_task, select_primary_face,
 )
 from PIL import Image
 from torchvision.transforms import transforms
@@ -53,6 +53,31 @@ cv2.setNumThreads(max(1, min(4, multiprocessing.cpu_count())))
 FACE_CROP_PADDING = 40
 SIMILARITY_THRESHOLD = 0.7
 FACE_DETECTION_CONFIDENCE_THRESHOLD = 0.5
+# SCRFD detection operating point.  Defaults preserve the previous
+# behaviour (InsightFace default det_thresh=0.5, det_size=640).  Lower
+# FACE_DET_THRESH (e.g. 0.35-0.4) recovers small/blurry/side-profile faces
+# at the cost of more false candidates; raise FACE_DET_SIZE (e.g. 800-960)
+# to keep small faces resolvable in high-res frames at the cost of speed.
+# Tune with: python benchmark.py --threads N
+FACE_DET_THRESH = float(os.getenv("FACE_DET_THRESH", "0.5"))
+FACE_DET_SIZE = int(os.getenv("FACE_DET_SIZE", "640"))
+
+
+def prepare_face_handler(handler):
+    """Apply the configured detection operating point to a FaceAnalysis.
+
+    Centralises what used to be bare ``prepare(ctx_id=0)`` calls so every
+    session (shared, per-camera, UI/crop) runs the same detector config.
+    """
+    handler.prepare(
+        ctx_id=0, det_thresh=FACE_DET_THRESH,
+        det_size=(FACE_DET_SIZE, FACE_DET_SIZE))
+    logging.info(
+        f"FaceAnalysis prepared: det_thresh={FACE_DET_THRESH} "
+        f"det_size={FACE_DET_SIZE}")
+    return handler
+
+
 RECOGNITION_UPDATE_INTERVAL = 2  # seconds
 STALE_TRACK_TTL = 30  # seconds before state for unseen track IDs is pruned
 JPEG_QUALITY = 85
@@ -320,7 +345,7 @@ class CCtvMonitor:
                 providers=['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device == 'cuda' else ['CPUExecutionProvider'],
                 root='.'
             )
-            handler.prepare(ctx_id=0)
+            prepare_face_handler(handler)
             self._face_sessions_created += 1
             logging.info(
                 f"Dedicated face session {self._face_sessions_created}/{MAX_FACE_SESSIONS} loaded")
@@ -342,7 +367,7 @@ class CCtvMonitor:
                 providers= ['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device=='cuda' else ['CPUExecutionProvider'],
                 root='.'
             )
-            self.face_handler.prepare(ctx_id=0)
+            prepare_face_handler(self.face_handler)
 
             # Shared one-shot YOLO instance; each camera creates its own via
             # create_yolo_instance so tracker state never mixes across cameras
@@ -421,6 +446,21 @@ class CCtvMonitor:
             self.known_names[name] = person[name]
         self._build_embedding_index()
         logging.info(f"Refreshed person '{name}' in CCTV monitor")
+
+    def remove_person(self, name):
+        """Evict a deleted person from memory and rebuild the index.
+
+        ``refresh_person`` cannot do this: it early-returns when the DB
+        record is gone, leaving the deleted person recognised until
+        restart.  Thread-safe via the index lock + atomic tuple swap.
+        """
+        with self._index_lock:
+            existed = self.known_names.pop(name, None) is not None
+        if existed:
+            self._build_embedding_index()
+            logging.info(f"Removed person '{name}' from CCTV monitor")
+        else:
+            logging.debug(f"remove_person: '{name}' not in memory")
 
     async def graceful_shutdown(self):
         """Gracefully shutdown the system"""
@@ -878,7 +918,13 @@ class CameraManager:
                             f"cam{self.camera_id}:face", time.perf_counter() - _t1)
 
                     if faces:
-                        face = faces[0]
+                        # A person crop can contain background faces;
+                        # the largest one is the tracked subject.
+                        if len(faces) > 1:
+                            logging.debug(
+                                f"cam{self.camera_id}: {len(faces)} faces in "
+                                f"track {track_id} crop, selecting largest")
+                        face = select_primary_face(faces)
 
                         fx1, fy1, fx2, fy2 = map(int, face.bbox)
                         if min(fx2 - fx1, fy2 - fy1) < MIN_FACE_PX:
@@ -974,11 +1020,23 @@ class CameraManager:
         # Aggregate by person: max similarity across all their embeddings
         best_sim = -1.0
         best_label = None
+        second_sim = -1.0
         for i, sim_val in enumerate(sims):
             s = float(sim_val)
             if s > best_sim:
+                second_sim = best_sim
                 best_sim = s
                 best_label = labels[i]
+            elif s > second_sim:
+                second_sim = s
+
+        # Debug-level diagnosis for "why wasn't this face recognised?"
+        # (enable with logging level DEBUG; no per-frame INFO spam).
+        logging.debug(
+            f"recognize_face: best={best_sim:.4f} "
+            f"({best_label[0] if best_label else 'none'}) "
+            f"second={second_sim:.4f} thr={self.config.simscore} "
+            f"refs={matrix.shape[0]}")
 
         if best_sim >= self.config.simscore and best_label is not None:
             name, age, gender, role, socialnumber = best_label
@@ -1215,18 +1273,27 @@ async def sendRegularFrames(source, request):
 _crop_face_handler = None
 _crop_face_lock = threading.Lock()
 
-def _get_crop_face_handler():
-    """Get or create cached FaceAnalysis handler for image_crop"""
+def _get_crop_face_handler(device: str = None):
+    """Get or create cached FaceAnalysis handler for image_crop.
+
+    Providers follow the requested device (or CUDA availability) instead
+    of unconditionally demanding CUDA, which broke CPU-only machines.
+    """
     global _crop_face_handler
     if _crop_face_handler is None:
         with _crop_face_lock:
             if _crop_face_handler is None:
+                use_cuda = (
+                    device == 'cuda' or
+                    (device is None and torch.cuda.is_available()))
                 _crop_face_handler = FaceAnalysis(
                     'antelopev2',
-                    providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
+                    providers=(['CUDAExecutionProvider',
+                                'CPUExecutionProvider'] if use_cuda
+                               else ['CPUExecutionProvider']),
                     root='.'
                 )
-                _crop_face_handler.prepare(ctx_id=0)
+                prepare_face_handler(_crop_face_handler)
     return _crop_face_handler
 
 def image_crop(filepath, isSearch):
@@ -1247,7 +1314,7 @@ def image_crop(filepath, isSearch):
         if not faces:
             raise ValueError("No faces detected in image")
 
-        facebox = faces[0].bbox
+        facebox = select_primary_face(faces).bbox
         x1, y1, x2, y2 = map(int, facebox)
 
         height_f, width_f = frame.shape[:2]
