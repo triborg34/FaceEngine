@@ -1,0 +1,89 @@
+# FACE RECOGNITION ACCURACY / DATABASE ADDITIONS
+# format: variableName<space>type<space>collection
+# types must be PocketBase field types: text | number | bool | json | file
+#
+# STATUS: already applied by these local migrations (pb_migrations/ is
+#         git-ignored together with pb_data/, so these files travel with
+#         the data directory, not with the repo):
+#           1790000001_updated_collection.js
+#           1790000002_updated_known_face.js
+#           1790000003_updated_setting.js
+#           1790000004_updated_setting.js
+#         The code sends these keys unconditionally; PocketBase drops
+#         unknown keys, so a fresh install without the migrations still
+#         runs - the values simply are not stored until the fields exist.
+#
+# NOTE: PocketBase backfills a newly added number column with 0 on the
+#       rows that already exist.  A stored 0 therefore always means "not
+#       configured": engine.resolve_setting_gates() and
+#       savatoDb.get_min_face_px() fall back to the code defaults, because
+#       e.g. maxYaw=0 would reject every face (|yaw| > 0 is always true)
+#       and silently disable recognition.
+
+# ---------------- collection  (detection event log) ----------------
+# cosine similarity of the identity match (collection.score today is only
+# the DETECTION confidence, which is misleading in the UI)
+sim                number    collection
+
+# raw face-detection confidence, kept separately so score stays unchanged
+detScore           number    collection
+
+# best minus second-best identity score - low value = ambiguous, untrusted
+matchMargin        number    collection
+
+# how many frames were fused before the identity was committed (vote count)
+obsCount           number    collection
+
+# variance of Laplacian on the face crop at capture time (sharpness)
+blur               number    collection
+
+# head yaw angle in degrees at capture time (profile faces score high)
+yaw                number    collection
+
+# stable known_face.id of the matched person (name can collide/duplicate)
+personId           text      collection
+
+
+# ---------------- known_face  (registered identities) ----------------
+# which model pack produced the embeddings - embeddings from different
+# packs are NOT comparable and must never be matched against each other
+embeddingModel     text      known_face
+
+# json array aligned by index with embdanings, one entry per reference:
+# [{"blur":142.3,"det":0.91,"yaw":-8.2,"model":"antelopev2",
+#   "added":"2026-09-26T00:00:00Z"}, ...]
+embeddingMeta      json      known_face
+
+# optional per-person similarity threshold override; 0 = use global simscore
+simThreshold       number    known_face
+
+# false = person is skipped by the matcher without deleting their refs
+isActive           bool      known_face
+
+
+# ---------------- setting  (global recognition gates) ----------------
+# minimum gap between best and second identity: rejects ambiguous matches
+marginMin          number    setting
+
+# frames to fuse before an identity is committed on a track
+voteObs            number    setting
+
+# fraction of observations that must agree before an identity is committed
+voteMajority       number    setting
+
+# minimum Laplacian-variance for a frame to count as an observation
+minBlur            number    setting
+
+# maximum absolute head yaw (deg) accepted as an observation
+maxYaw             number    setting
+
+# smallest accepted face (px, shorter bbox side).  Gates /detect-faces,
+# registration and the live worker together.  Env MIN_FACE_PX overrides.
+minFacePx          number    setting
+
+
+# ---------------- indexes (not fields) ----------------
+# collection (score)            -> report filtering
+# collection (name, date)       -> report queries
+# collection (personId, created)-> per-person history
+# known_face  (name)            -> lookup speed (find_person_record)

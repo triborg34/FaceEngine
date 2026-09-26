@@ -229,18 +229,129 @@ def face_blur_score(face_crop_bgr) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
+# Identity model pack that produced the embeddings stored in this
+# deployment.  Vectors coming from different packs (antelopev2 vs
+# buffalo_l, ...) are NOT comparable: matching them silently destroys
+# accuracy because every score becomes meaningless.  Records carrying a
+# different tag are excluded from the matcher.
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "antelopev2/glintr100")
+
+# Quality gate defaults for reference images at registration time.
+DEFAULT_MIN_BLUR = float(os.getenv("MIN_FACE_BLUR", "10.0"))
+
+# Smallest face the pipeline accepts, in pixels (shorter side of the bbox).
+# Measured on this deployment's 1400px CCTV frames: a 56px face still
+# matches the same person across scales at cosine 0.69-0.88 (gate is
+# 0.60), so the historical 64px floor was silently rejecting usable
+# frames and returning "No face detected in image".
+DEFAULT_MIN_FACE_PX = int(os.getenv("MIN_FACE_PX", "40"))
+
+
+def get_min_face_px(config=None) -> int:
+    """Effective minimum face size (pixels) for detection/embedding gates.
+
+    Resolution order: an explicit ``MIN_FACE_PX`` environment variable
+    (deployment override) beats ``setting.minFacePx`` from PocketBase,
+    which beats ``DEFAULT_MIN_FACE_PX``.  Pass the runtime config object
+    (e.g. ``CCtvMonitor``) to honour the DB setting; registration paths
+    that have no config use the env/default value.
+    """
+    env = os.getenv("MIN_FACE_PX")
+    if env:
+        try:
+            return max(8, int(float(env)))
+        except ValueError:
+            logging.warning(f"get_min_face_px: bad MIN_FACE_PX={env!r}")
+    if config is not None:
+        try:
+            value = getattr(config, "minFacePx", None)
+            if value not in (None, "") and float(value) > 0:
+                return int(float(value))
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_MIN_FACE_PX
+
+
+def face_yaw(face) -> float:
+    """Head yaw in degrees from the 1k3d68 landmark model (0.0 if absent).
+
+    The ``pose`` attribute is only populated when the landmark_3d_68 model
+    is loaded in the pack; older/trimmed packs leave it unset and the Face
+    dict returns None, in which case yaw is simply unknown (0.0).
+    """
+    pose = getattr(face, "pose", None)
+    if pose is None:
+        return 0.0
+    try:
+        return float(pose[1])
+    except (TypeError, IndexError, ValueError):
+        return 0.0
+
+
+def build_embedding_meta(blur: float = 0.0, det: float = 0.0,
+                         yaw: float = 0.0, model: str = None) -> dict:
+    """One ``embeddingMeta`` entry describing a stored reference vector."""
+    return {
+        "blur": round(float(blur), 2),
+        "det": round(float(det), 4),
+        "yaw": round(float(yaw), 2),
+        "model": model or EMBEDDING_MODEL,
+        "added": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def parse_embedding_meta(value) -> list:
+    """Parse the ``embeddingMeta`` json field into a list of dicts."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return []
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return []
+    if not isinstance(value, list):
+        return []
+    return [e for e in value if isinstance(e, dict)]
+
+
+def fit_meta_length(meta: list, count: int) -> list:
+    """Pad/trim *meta* so it stays index-aligned with *count* embeddings.
+
+    Records written before ``embeddingMeta`` existed have no per-vector
+    quality data; padding keeps every later index in sync instead of
+    shifting entries onto the wrong embedding.
+    """
+    meta = list(meta or [])
+    if len(meta) > count:
+        return meta[:count]
+    while len(meta) < count:
+        meta.append({"model": EMBEDDING_MODEL})
+    return meta
+
+
 def extract_face_embedding(image_path: str, face_embedder, face_lock=None,
                            model=None, model_lock=None, device: str = 'cpu',
-                           min_face_px: int = 64) -> Optional[np.ndarray]:
+                           min_face_px: int = None,
+                           return_meta: bool = False):
     """Detect a face in *image_path* and return the 512-d embedding.
 
     Returns None if the image can't be read, no face is found, or the face
-    is too small.
+    is too small.  With ``return_meta=True`` the result is an
+    ``(embedding, meta)`` tuple and failures come back as
+    ``(None, None)`` so callers can unpack uniformly.
     """
+    def _fail():
+        return (None, None) if return_meta else None
+
+    min_face_px = min_face_px or get_min_face_px()
+
     img = cv2.imread(image_path)
     if img is None:
         logging.error(f"extract_face_embedding: cannot read image: {image_path}")
-        return None
+        return _fail()
 
     # Optionally run YOLO person detection first to crop the person region
     if model is not None:
@@ -255,7 +366,7 @@ def extract_face_embedding(image_path: str, face_embedder, face_lock=None,
 
     if not faces:
         logging.warning(f"extract_face_embedding: no face detected in '{image_path}'")
-        return None
+        return _fail()
 
     if len(faces) > 1:
         logging.debug(
@@ -268,7 +379,7 @@ def extract_face_embedding(image_path: str, face_embedder, face_lock=None,
             f"extract_face_embedding: face too small "
             f"({fx2 - fx1}x{fy2 - fy1}px, need >={min_face_px}px) "
             f"in '{image_path}'")
-        return None
+        return _fail()
 
     # Quality gate: reject extremely blurry reference faces so one bad
     # photo can't poison the person's embedding set.  Threshold is
@@ -276,17 +387,26 @@ def extract_face_embedding(image_path: str, face_embedder, face_lock=None,
     h, w = img.shape[:2]
     crop = img[max(fy1, 0):min(fy2, h), max(fx1, 0):min(fx2, w)]
     blur = face_blur_score(crop)
-    min_blur = float(os.getenv("MIN_FACE_BLUR", "10.0"))
+    yaw = face_yaw(face)
     det = float(getattr(face, "det_score", 0.0) or 0.0)
+    min_blur = DEFAULT_MIN_BLUR
     logging.debug(
         f"extract_face_embedding: '{image_path}' face {fx2 - fx1}x{fy2 - fy1}px "
-        f"det={det:.3f} blur={blur:.1f}")
+        f"det={det:.3f} blur={blur:.1f} yaw={yaw:.1f}")
     if blur < min_blur:
         logging.warning(
             f"extract_face_embedding: rejecting blurry face "
             f"(blur={blur:.1f} < {min_blur}) in '{image_path}'")
-        return None
+        return _fail()
 
+    if face.embedding is None:
+        logging.error(
+            f"extract_face_embedding: recognition model produced no "
+            f"embedding for '{image_path}'")
+        return _fail()
+
+    if return_meta:
+        return face.embedding, build_embedding_meta(blur, det, yaw)
     return face.embedding
 
 
@@ -422,9 +542,11 @@ def create_person_in_db(name: str, embedding: np.ndarray, img_path: str,
                         face_crop_b64: str = None,
                         face_crop_path: str = None,
                         userwhom: str = "",
-                        description: str = "") -> bool:
+                        description: str = "",
+                        meta: dict = None) -> bool:
     """Create a new person record with one initial face embedding."""
     url = "http://127.0.0.1:8091/api/collections/known_face/records"
+    meta = meta or build_embedding_meta()
     data = {
         "name": name,
         "embdanings": json.dumps(embedding.tolist()),
@@ -434,6 +556,12 @@ def create_person_in_db(name: str, embedding: np.ndarray, img_path: str,
         "socialnumber": socialnumber,
         "userwhom": userwhom,
         "description": description,
+        # Which model pack produced the vector, and per-vector quality
+        # (blur/det/yaw).  PocketBase silently drops unknown keys, so this
+        # is safe to send before the fields exist in the schema.
+        "embeddingModel": EMBEDDING_MODEL,
+        "embeddingMeta": json.dumps([meta]),
+        "isActive": True,
     }
     if face_crop_b64:
         data["face_crop"] = face_crop_b64
@@ -470,14 +598,22 @@ def update_person_embeddings(name: str, all_embeddings: list, record: dict,
                              face_crop_b64: str = None,
                              face_crop_path: str = None,
                              userwhom: str = "",
-                             description: str = "") -> bool:
+                             description: str = "",
+                             metas: list = None) -> bool:
     """Replace the full embedding list for an existing person.
 
     *all_embeddings* should be a list of np.ndarray (512-d each).
     This APPENDS the new embedding to the existing ones (unless the
     embedding is already present).
+
+    *metas* is the index-aligned ``embeddingMeta`` list; when omitted the
+    previous entries are preserved and padded.
     """
     record_id = record['id']
+    if metas is None:
+        metas = fit_meta_length(
+            parse_embedding_meta(record.get("embeddingMeta")),
+            len(all_embeddings))
     data = {
         "embdanings": json.dumps([e.tolist() for e in all_embeddings]),
         "name": name,
@@ -487,6 +623,9 @@ def update_person_embeddings(name: str, all_embeddings: list, record: dict,
         "socialnumber": socialnumber,
         "userwhom": userwhom,
         "description": description,
+        "embeddingModel": EMBEDDING_MODEL,
+        "embeddingMeta": json.dumps(metas),
+        "isActive": True,
     }
     if face_crop_b64:
         data["face_crop"] = face_crop_b64
@@ -532,14 +671,19 @@ def add_embedding_to_person(name: str, new_embedding: np.ndarray,
                             description: str = "",
                             face_handler=None, face_lock=None,
                             model=None, model_lock=None,
-                            device: str = 'cpu') -> bool:
+                            device: str = 'cpu',
+                            meta: dict = None) -> bool:
     """Append *new_embedding* to an existing person's embedding list.
 
     If the person doesn't exist yet, creates them.
     Duplicate embeddings (cosine similarity > 0.99) are skipped.
 
     If face_handler is provided, a face crop is generated and stored
-    in the ``face_crop`` field of the PocketBase record.
+    in the ``faceCrop`` file field of the PocketBase record.
+
+    *meta* is the quality record for the new vector (blur/det/yaw/model);
+    it is appended to ``embeddingMeta`` so quality stays index-aligned
+    with ``embdanings``.
     """
     # Generate face crop for storage
     face_crop_b64 = None
@@ -558,7 +702,7 @@ def add_embedding_to_person(name: str, new_embedding: np.ndarray,
         return create_person_in_db(
             name, new_embedding, img_path, age, gender, role, socialnumber,
             face_crop_b64=face_crop_b64, face_crop_path=face_crop_path,
-            userwhom=userwhom, description=description)
+            userwhom=userwhom, description=description, meta=meta)
 
     # Parse existing embeddings (handles both JSON-string and
     # native-list field representations)
@@ -570,6 +714,12 @@ def add_embedding_to_person(name: str, new_embedding: np.ndarray,
             continue
         if arr.shape == (512,):
             existing_embeddings.append(arr)
+
+    # Keep embeddingMeta index-aligned with embdanings so the new entry
+    # lands at the same position as the new vector.
+    existing_meta = fit_meta_length(
+        parse_embedding_meta(record.get("embeddingMeta")),
+        len(existing_embeddings))
 
     # Check for duplicate (cosine similarity > 0.99)
     new_emb_norm = new_embedding.astype(np.float32)
@@ -590,6 +740,7 @@ def add_embedding_to_person(name: str, new_embedding: np.ndarray,
             return True
 
     existing_embeddings.append(new_embedding)
+    existing_meta.append(meta or build_embedding_meta())
     logging.info(
         f"add_embedding_to_person: appending embedding for '{name}' "
         f"(now {len(existing_embeddings)} total)")
@@ -597,7 +748,7 @@ def add_embedding_to_person(name: str, new_embedding: np.ndarray,
         name, existing_embeddings, record, img_path, age, gender, role,
         socialnumber, face_crop_b64=face_crop_b64,
         face_crop_path=face_crop_path,
-        userwhom=userwhom, description=description)
+        userwhom=userwhom, description=description, metas=existing_meta)
 
 
 def remove_person_embedding(name: str, embedding_index: int) -> bool:
@@ -632,11 +783,18 @@ def remove_person_embedding(name: str, embedding_index: int) -> bool:
         return False
 
     existing_embeddings.pop(embedding_index)
+    existing_meta = fit_meta_length(
+        parse_embedding_meta(record.get("embeddingMeta")),
+        len(existing_embeddings) + 1)
+    if embedding_index < len(existing_meta):
+        existing_meta.pop(embedding_index)
+    existing_meta = fit_meta_length(existing_meta, len(existing_embeddings))
 
     record_id = record['id']
     data = {
         "embdanings": json.dumps([e.tolist() for e in existing_embeddings]),
-        "name": name,
+        "embeddingMeta": json.dumps(existing_meta),
+        "name": record.get('name', name),
         "gender": record.get('gender', ''),
         "age": record.get('age', ''),
         "role": record.get('role', ''),
@@ -717,7 +875,9 @@ def get_person_faces(name: str) -> Optional[dict]:
         "socialnumber": record.get("socialnumber", ""),
         "embedding_count": embedding_count,
         "record_id": record.get("id", ""),
-        "face_crop": record.get("face_crop", ""),
+        # The stored face crop lives in the `faceCrop` FILE field; the old
+        # code read a non-existent `face_crop` key and always returned "".
+        "face_crop": record.get("faceCrop") or record.get("face_crop", ""),
         "image": record.get("image", ""),
     }
 
@@ -728,13 +888,13 @@ def get_person_faces(name: str) -> Optional[dict]:
 
 def reciveFromUi(name, imagePath, age, gender, role, socialnumber, isUrl, device,
                  face_embedder, model, face_lock=None, model_lock=None,
-                 userwhom="", description=""):
+                 userwhom="", description="", min_face_px: int = None):
     """Receive data from the UI and process it, reusing the shared models.
 
     Registers or updates a person with a single face image.
     For multi-image support, use ``reciveFromUi_multi``.
     """
-    min_face_px = int(os.getenv("MIN_FACE_PX", "64"))
+    min_face_px = min_face_px or get_min_face_px()
 
     if isUrl:
         path = urllib.request.urlretrieve(
@@ -748,9 +908,9 @@ def reciveFromUi(name, imagePath, age, gender, role, socialnumber, isUrl, device
     # Single shared detection path: largest face + size/blur quality gate
     # (see extract_face_embedding).  imagePath must still exist on disk
     # because add_embedding_to_person re-reads it for the face crop.
-    embed = extract_face_embedding(
+    embed, meta = extract_face_embedding(
         imagePath, face_embedder, face_lock, model, model_lock,
-        device, min_face_px)
+        device, min_face_px, return_meta=True)
     if embed is None:
         raise ValueError(
             f"No usable face in '{imagePath}'. Register people from "
@@ -760,7 +920,7 @@ def reciveFromUi(name, imagePath, age, gender, role, socialnumber, isUrl, device
         name, embed, imagePath, age, gender, role, socialnumber,
         userwhom=userwhom, description=description,
         face_handler=face_embedder, face_lock=face_lock,
-        model=model, model_lock=model_lock, device=device)
+        model=model, model_lock=model_lock, device=device, meta=meta)
     return name
 
 
@@ -770,12 +930,13 @@ def reciveFromUi_multi(name: str, image_paths: list[str], age: str,
                        model=None, face_lock=None,
                        model_lock=None,
                        userwhom: str = "",
-                       description: str = "") -> dict:
+                       description: str = "",
+                       min_face_px: int = None) -> dict:
     """Register a person with multiple face images in one call.
 
     Returns a dict with per-image success/failure information.
     """
-    min_face_px = int(os.getenv("MIN_FACE_PX", "64"))
+    min_face_px = min_face_px or get_min_face_px()
     results: list[dict] = []
     success_count = 0
     fail_count = 0
@@ -788,9 +949,9 @@ def reciveFromUi_multi(name: str, image_paths: list[str], age: str,
                     image_path, f"uploads/multi-{name}-{i}.jpg")
                 image_path = local_path[0]
 
-            embed = extract_face_embedding(
+            embed, meta = extract_face_embedding(
                 image_path, face_embedder, face_lock, model, model_lock,
-                device, min_face_px)
+                device, min_face_px, return_meta=True)
 
             if embed is None:
                 entry["error"] = "No valid face detected or face too small"
@@ -808,7 +969,7 @@ def reciveFromUi_multi(name: str, image_paths: list[str], age: str,
                 name, embed, image_path, age, gender, role, socialnumber,
                 userwhom=userwhom, description=description,
                 face_handler=face_embedder, face_lock=face_lock,
-                model=model, model_lock=model_lock, device=device)
+                model=model, model_lock=model_lock, device=device, meta=meta)
             entry["success"] = ok
             if ok:
                 success_count += 1
@@ -858,46 +1019,31 @@ def load_embeddings_from_db() -> dict:
     """Load all known face embeddings from the database.
 
     Returns a dict keyed by person name, each containing a list of 512-d
-    numpy embeddings (multi-reference support).
+    numpy embeddings (multi-reference support) plus ``id`` (stable
+    ``known_face`` record id, used as the person id in detection logs) and
+    ``embeddingModel``.
     """
     known_names = {}
-    url = "http://127.0.0.1:8091/api/collections/known_face/records?perPage=1000"
+    base_url = "http://127.0.0.1:8091/api/collections/known_face/records"
+    per_page = 500
 
     try:
-        res = _session.get(url, timeout=5)
-        res.raise_for_status()
-        records = res.json()["items"]
+        page = 1
+        while True:
+            res = _session.get(
+                base_url,
+                params={"perPage": per_page, "page": page, "sort": "-created"},
+                timeout=10)
+            res.raise_for_status()
+            payload = res.json()
+            records = payload.get("items", [])
 
-        for item in records:
-            name = item["name"]
-            age = item.get('age')
-            gender = item.get('gender')
-            role = item.get('role')
-            socialnumber = item.get('socialnumber')
+            for item in records:
+                _ingest_person_record(known_names, item)
 
-            reshaped = parse_embeddings_field(item.get("embdanings"))
-            if not reshaped:
-                logging.warning(
-                    f"load_embeddings_from_db: no valid embeddings "
-                    f"for '{name}', skipped")
-                continue
-
-            if name not in known_names:
-                known_names[name] = {
-                    'age': age,
-                    'gender': gender,
-                    'role': role,
-                    'socialnumber': socialnumber,
-                    'embeddings': []
-                }
-
-            for emb in reshaped:
-                try:
-                    emb_array = np.array(emb, dtype=np.float32)
-                except (ValueError, TypeError):
-                    continue
-                if emb_array.shape == (512,):
-                    known_names[name]['embeddings'].append(emb_array)
+            if not payload.get("page") or page >= int(payload.get("totalPages", 1)):
+                break
+            page += 1
 
         total_embeddings = sum(
             len(person['embeddings']) for person in known_names.values())
@@ -911,33 +1057,81 @@ def load_embeddings_from_db() -> dict:
         return {}
 
 
+def _ingest_person_record(known_names: dict, item: dict) -> None:
+    """Fold one known_face record into the in-memory person table."""
+    name = item.get("name")
+    if not name:
+        return
+
+    if item.get("isActive") is False:
+        logging.info(f"load_embeddings_from_db: '{name}' is inactive, skipped")
+        return
+
+    model = item.get("embeddingModel")
+    if model and model != EMBEDDING_MODEL:
+        # Mixing packs is worse than having fewer references: every score
+        # would be meaningless.  Skip with an explicit warning instead.
+        logging.warning(
+            f"load_embeddings_from_db: '{name}' was registered with "
+            f"'{model}' but this build matches with '{EMBEDDING_MODEL}'; "
+            f"skipped to avoid cross-pack false matches")
+        return
+
+    age = item.get('age')
+    gender = item.get('gender')
+    role = item.get('role')
+    socialnumber = item.get('socialnumber')
+
+    reshaped = parse_embeddings_field(item.get("embdanings"))
+    if not reshaped:
+        logging.warning(
+            f"load_embeddings_from_db: no valid embeddings "
+            f"for '{name}', skipped")
+        return
+
+    if name in known_names:
+        logging.warning(
+            f"load_embeddings_from_db: duplicate known_face name '{name}' "
+            f"(ids {known_names[name].get('id')} and {item.get('id')}) - "
+            f"identities with the same display name cannot be told apart")
+        person = known_names[name]
+    else:
+        person = known_names[name] = {
+            'age': age,
+            'gender': gender,
+            'role': role,
+            'socialnumber': socialnumber,
+            'id': item.get('id', ''),
+            'embeddingModel': model or EMBEDDING_MODEL,
+            'simThreshold': item.get('simThreshold'),
+            'embeddings': []
+        }
+
+    for emb in reshaped:
+        try:
+            emb_array = np.array(emb, dtype=np.float32)
+        except (ValueError, TypeError):
+            continue
+        if emb_array.shape == (512,):
+            person['embeddings'].append(emb_array)
+
+
 def load_person_from_db(name: str) -> Optional[dict]:
     """Load a single known_face record (avoids a full 1000-record fetch)."""
     record = find_person_record(name)
     if not record:
         return None
 
-    age = record.get('age')
-    gender = record.get('gender')
-    role = record.get('role')
-    socialnumber = record.get('socialnumber')
-
-    reshaped = parse_embeddings_field(record.get("embdanings"))
-    embeddings = []
-    for emb in reshaped:
-        try:
-            arr = np.array(emb, dtype=np.float32)
-        except (ValueError, TypeError):
-            continue
-        if arr.shape == (512,):
-            embeddings.append(arr)
-    if not embeddings:
+    known_names: dict = {}
+    _ingest_person_record(known_names, record)
+    if name not in known_names:
+        # Inactive or cross-pack record: report it as absent so the caller
+        # evicts the person from the matcher instead of keeping them.
         logging.warning(
-            f"load_person_from_db: no valid embeddings for '{name}'")
-    return {name: {
-        'age': age, 'gender': gender, 'role': role,
-        'socialnumber': socialnumber, 'embeddings': embeddings
-    }}
+            f"load_person_from_db: '{name}' loaded but not matchable "
+            f"(inactive or model mismatch)")
+        return None
+    return {name: known_names[name]}
 
 
 # ---------------------------------------------------------------------------
@@ -1013,11 +1207,19 @@ def should_insert(name, track_id):
 
 def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender,
                age, role, socialnumber, path, quality, regions, isRelay: bool,
-               isRegionMode: bool, ip_relay, port_relay, relayn1, relayn2):
+               isRegionMode: bool, ip_relay, port_relay, relayn1, relayn2,
+               sim: float = 0.0, margin: float = 0.0, obs_count: int = 0,
+               person_id: str = "", blur: float = 0.0, yaw: float = 0.0,
+               det_score: float = None):
     """Record a detection event (screenshot + cropped + metadata to PocketBase).
 
     This logs *every recognised detection*; it is NOT the same as
     registering a known face.  It runs on the DbWorker thread pool.
+
+    ``score`` stays the detection confidence because the Flutter UI reads
+    ``collection.score``; the identity evidence is written to the
+    additive ``sim`` / ``matchMargin`` / ``obsCount`` fields so nothing
+    in the existing UI breaks.
     """
     url = "http://127.0.0.1:8091/api/collections/collection/records"
     timeNow = datetime.datetime.now()
@@ -1053,9 +1255,18 @@ def insertToDb(name, frame, croppedface, humancrop, score, track_id, gender,
                 "humancrop": (human_loc, file3, "image/jpeg")
             }
 
+            # Unknown keys are dropped by PocketBase (verified), so these
+            # can be sent before the fields are added to the collection.
             response = _session.post(url, files=files, timeout=10, data={
                 "name": name,
                 "score": score,
+                "detScore": (score if det_score is None else det_score),
+                "sim": round(float(sim or 0.0), 4),
+                "matchMargin": round(float(margin or 0.0), 4),
+                "obsCount": int(obs_count or 0),
+                "blur": round(float(blur or 0.0), 2),
+                "yaw": round(float(yaw or 0.0), 2),
+                "personId": person_id or "",
                 'gender': gender,
                 'age': age,
                 'camera': path,

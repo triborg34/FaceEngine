@@ -25,6 +25,7 @@ from camera import FreshestFrame
 from savatoDb import (
     load_embeddings_from_db, load_person_from_db, insertToDb,
     get_db_worker, submit_db_task, select_primary_face,
+    face_blur_score, face_yaw, get_min_face_px, DEFAULT_MIN_FACE_PX,
 )
 from PIL import Image
 from torchvision.transforms import transforms
@@ -51,7 +52,7 @@ cv2.setNumThreads(max(1, min(4, multiprocessing.cpu_count())))
 
 # --- Constants ---
 FACE_CROP_PADDING = 40
-SIMILARITY_THRESHOLD = 0.7
+SIMILARITY_THRESHOLD = 0.5
 FACE_DETECTION_CONFIDENCE_THRESHOLD = 0.5
 # SCRFD detection operating point.  Defaults preserve the previous
 # behaviour (InsightFace default det_thresh=0.5, det_size=640).  Lower
@@ -79,12 +80,58 @@ def prepare_face_handler(handler):
 
 
 RECOGNITION_UPDATE_INTERVAL = 2  # seconds
+# Minimum gap between recognition attempts on the SAME track.  The old
+# pipeline recognised a track exactly once for its whole lifetime, so a
+# single unlucky frame (blur, profile, partial occlusion) decided the
+# identity forever.  A short gap lets us collect several observations and
+# vote on them instead.
+OBS_INTERVAL = float(os.getenv("OBS_INTERVAL", "0.5"))
+# Fallbacks for the new `setting` fields.  They are read from PocketBase
+# at startup and ignored by PocketBase until the fields are added, so the
+# defaults keep behaviour defined in one place.
+DEFAULT_MARGIN_MIN = 0.06      # best-vs-2nd cosine gap for a trusted match
+DEFAULT_VOTE_OBS = 5           # observations needed before committing
+DEFAULT_VOTE_MAJORITY = 0.6    # fraction of observations that must agree
+DEFAULT_MIN_BLUR = 10.0        # Laplacian variance gate for observations
+DEFAULT_MAX_YAW = 35.0         # |yaw| gate in degrees
 STALE_TRACK_TTL = 30  # seconds before state for unseen track IDs is pruned
 JPEG_QUALITY = 85
-# Faces smaller than this produce unstable ArcFace embeddings (landmark
-# alignment jitter): same person scores randomly 0.2-0.5 across scales.
-# Skip them instead of storing/embedding garbage.
-MIN_FACE_PX = int(os.getenv("MIN_FACE_PX", "64"))
+# Smallest face this pipeline accepts (shorter bbox side, px).  The old
+# 64px floor was measured against a wrong assumption: same identity across
+# scales still scores 0.69-0.88 at 25-56px, so it only threw away usable
+# frames ("no face detected").  Resolution (env MIN_FACE_PX >
+# setting.minFacePx > default) lives in savatoDb.get_min_face_px.
+MIN_FACE_PX = get_min_face_px()
+
+# Recognition gates stored in the `setting` collection.  A stored 0 means
+# "not configured" and never "no gate": PocketBase backfills the number
+# columns it just added with 0 on pre-existing rows, and 0 is not a
+# meaningful value for any of them - maxYaw=0 rejects every face (|yaw|>0
+# is always true), minBlur=0 disables the sharpness check, voteObs=0 makes
+# the fusion need only 2 frames.  Values are resolved here so the zeroed
+# defaults cannot silently disable the whole accuracy layer.
+_SETTING_GATES = (
+    ('marginMin', DEFAULT_MARGIN_MIN, float),
+    ('voteObs', DEFAULT_VOTE_OBS, int),
+    ('voteMajority', DEFAULT_VOTE_MAJORITY, float),
+    ('minBlur', DEFAULT_MIN_BLUR, float),
+    ('maxYaw', DEFAULT_MAX_YAW, float),
+    ('minFacePx', DEFAULT_MIN_FACE_PX, int),
+)
+
+
+def resolve_setting_gates(data) -> dict:
+    """Gate values from a ``setting`` record; 0 / absent / junk -> default."""
+    data = data or {}
+    gates = {}
+    for key, default, cast in _SETTING_GATES:
+        try:
+            value = data.get(key)
+            number = float(default) if value in (None, "") else float(value)
+        except (TypeError, ValueError):
+            number = float(default)
+        gates[key] = cast(number) if number > 0 else cast(default)
+    return gates
 # Dedicated InsightFace sessions per camera (opt-in via env). Measured on
 # this machine: one SHARED session sustains ~88 calls/s across camera
 # threads while concurrent sessions collapse to ~9 calls/s (GPU context
@@ -144,7 +191,9 @@ class CCtvMonitor:
         self.RETRY_LIMIT = 5
         self.RETRY_DELAY = 3
         self.ip_relay, self.ip_port, self.relayN1, self.relayN2 = '', '', '', ''
-        self.score, self.padding, self.quality, self.hscore, self.simscore, self.port, self.isRegionMode, self.isRelay, self.iou = self.loadConfig()
+        # loadConfig returns every setting as a dict (including the new
+        # recognition gates); spread it onto the instance in one shot.
+        self.__dict__.update(self.loadConfig())
 
         # Initialize models
         self.model = None
@@ -188,7 +237,7 @@ class CCtvMonitor:
         # regions
 
 
-        self.loadWebBrowser(self.port)
+        # self.loadWebBrowser(self.port)
 
     def checkOnnx(self):
         directory = 'models'
@@ -226,20 +275,80 @@ class CCtvMonitor:
         webbrowser.open(f'http://127.0.0.1:{port}/web/app')
 
     def loadConfig(self):
-        with open('iou.txt') as file:
-            iou = file.readline()
-        iou = float(iou)
+        """Read runtime configuration from PocketBase.
+
+        Returns a dict of every config attribute.  Retries for up to ~30s
+        because ``__init__`` starts PocketBase and used to read it in the
+        same tick: whenever the DB was slow the connection was refused and
+        startup died with an unhandled exception.
+        """
+        try:
+            with open('iou.txt') as file:
+                iou = float(file.readline().strip())
+        except (OSError, ValueError) as e:
+            logging.warning(f"loadConfig: bad iou.txt ({e}), using 0.45")
+            iou = 0.45
+
         uri = 'http://127.0.0.1:8091/api/collections/setting/records'
-        response = requests.get(uri, timeout=5)
-        data = response.json().get('items')[0]
-        if data['isRfid']:
-            self.ip_relay, self.ip_port, self.relayN1, self.relayN2 = data['rfidip'].strip(
-            ), data['rfidport'], data['rl1'], data['rl2']
-        if data['rl1']:
+        data = None
+        last_err = None
+        for attempt in range(30):
+            try:
+                response = requests.get(uri, timeout=5)
+                response.raise_for_status()
+                items = response.json().get('items') or []
+                if items:
+                    data = items[0]
+                    break
+                last_err = "setting collection is empty"
+            except Exception as e:  # connection refused / timeout / 5xx
+                last_err = e
+            time.sleep(1.0)
+        if data is None:
+            logging.error(
+                f"loadConfig: PocketBase not ready after retries ({last_err}); "
+                f"falling back to built-in defaults")
+
+        data = data or {}
+
+        def _num(key, default, cast=float):
+            try:
+                value = data.get(key)
+                if value is None or value == "":
+                    return default
+                return cast(value)
+            except (TypeError, ValueError):
+                return default
+
+        if data.get('isRfid'):
+            self.ip_relay, self.ip_port, self.relayN1, self.relayN2 = (
+                data.get('rfidip', '').strip(), data.get('rfidport'),
+                data.get('rl1'), data.get('rl2'))
+        if data.get('rl1'):
             self.relayN1 = 1
-        if data['rl2']:
+        if data.get('rl2'):
             self.relayN2 = 2
-        return float(data['score']), data['padding'], int(data['quality']), float(data['hscore']), float(data['simscore']), data['port'], data['isregion'], data['isRfid'], iou
+
+        cfg = {
+            'score': _num('score', 0.6),
+            'padding': _num('padding', 40, int),
+            'quality': _num('quality', 100, int),
+            'hscore': _num('hscore', 0.6),
+            'simscore': _num('simscore', 0.6),
+            'port': data.get('port') or '8003',
+            'isRegionMode': bool(data.get('isregion', False)),
+            'isRelay': bool(data.get('isRfid', False)),
+            'iou': iou,
+            # New accuracy gates (see change_to_database.txt): a zeroed
+            # column means "not configured", see resolve_setting_gates.
+            **resolve_setting_gates(data),
+        }
+        logging.info(
+            f"Config: score={cfg['score']} simscore={cfg['simscore']} "
+            f"marginMin={cfg['marginMin']} voteObs={cfg['voteObs']} "
+            f"minBlur={cfg['minBlur']} maxYaw={cfg['maxYaw']} "
+            f"minFacePx={cfg['minFacePx']}")
+        return cfg
 
     def load_image_searcher_model(self):
         """Load the ResNet50 search model once and cache it"""
@@ -398,21 +507,35 @@ class CCtvMonitor:
     def _build_embedding_index(self):
         """Pre-build flat numpy matrix for fast batch cosine similarity.
 
+        Rows are grouped by person so ``recognize_face`` can reduce to one
+        score per identity with ``np.maximum.reduceat`` (no per-frame
+        Python loop over every reference image).
+
         Thread-safe: acquires _index_lock to serialise rebuilds.  The swap
         itself is a single tuple assignment so readers always see a
-        consistent (matrix, labels) snapshot.
+        consistent (matrix, person_labels, person_starts) snapshot.
         """
         all_embeddings = []
-        labels = []  # parallel list of (name, age, gender, role, socialnumber)
+        person_labels = []
+        person_starts = []
 
         for name, person_data in self.known_names.items():
-            age = person_data.get('age', 'None')
-            gender = person_data.get('gender', 'None')
-            role = person_data.get('role', '')
-            socialnumber = person_data.get('socialnumber', '')
-            for emb in person_data.get('embeddings', []):
-                all_embeddings.append(emb)
-                labels.append((name, age, gender, role, socialnumber))
+            embs = person_data.get('embeddings', [])
+            if not embs:
+                continue
+            # 7-tuple; index 6 is the per-person threshold override
+            # (0/None = use the global simscore).
+            person_labels.append((
+                name,
+                person_data.get('age', 'None'),
+                person_data.get('gender', 'None'),
+                person_data.get('role', ''),
+                person_data.get('socialnumber', ''),
+                person_data.get('id', ''),
+                person_data.get('simThreshold'),
+            ))
+            person_starts.append(len(all_embeddings))
+            all_embeddings.extend(embs)
 
         if all_embeddings:
             matrix = np.array(all_embeddings, dtype=np.float32)
@@ -420,16 +543,20 @@ class CCtvMonitor:
             norms = np.linalg.norm(matrix, axis=1, keepdims=True)
             norms[norms == 0] = 1
             matrix = matrix / norms
+            starts = np.asarray(person_starts, dtype=np.int64)
         else:
             matrix = np.empty((0, 512), dtype=np.float32)
+            starts = np.empty((0,), dtype=np.int64)
 
         # Single atomic swap under lock so concurrent rebuilds (e.g. two
         # registration API calls) don't race, while recognition threads
         # read the tuple without locking (they see either old or new,
         # never half-built).
         with self._index_lock:
-            self.embedding_index = (matrix, labels)
-        logging.info(f"Embedding index built: {len(labels)} vectors")
+            self.embedding_index = (matrix, person_labels, starts)
+        logging.info(
+            f"Embedding index built: {len(person_labels)} persons / "
+            f"{len(all_embeddings)} vectors")
 
     def refresh_person(self, name):
         """Incrementally refresh a single person instead of a full DB reload.
@@ -522,7 +649,14 @@ class CameraManager:
         
         # ========== OPTIMIZED QUEUES ==========
         self.frame_queue = queue.Queue(maxsize=2)
-        self.recognition_queue = queue.Queue(maxsize=5)
+        # Recognition is fed by a latest-per-track slot map instead of a
+        # bounded queue: with a queue, N people all pushing every frame
+        # overflowed maxsize=5 and the tracks that lost the race were
+        # never recognised at all.  A map keeps exactly one pending crop
+        # per track, so no person can starve another.
+        self._pending_lock = threading.Lock()
+        self._pending_tracks = {}
+        self._pending_event = threading.Event()
         
         # ---------- DATA ----------
         self._processed_tracks_lock = threading.Lock()
@@ -531,6 +665,10 @@ class CameraManager:
         self.face_info_lock = threading.Lock()
         self.embedding_cache = {}
         self._cache_lock = threading.Lock()
+        # Per-track observation buffer used to vote on an identity before
+        # committing it (see _fuse_observations / _commit_track).
+        self.track_obs = {}
+        self._track_obs_lock = threading.Lock()
         self.last_seen = {}  # track_id -> timestamp, for pruning stale state
         self._last_prune = 0.0
         self._jpeg_params = [cv2.IMWRITE_JPEG_QUALITY,
@@ -761,22 +899,18 @@ class CameraManager:
                             continue
 
                         # Draw bounding box
-                        cv2.rectangle(processed_frame, (x1, y1),
-                                      (x2, y2), (0, 255, 0), 2)
+                        # cv2.rectangle(processed_frame, (x1, y1),
+                        #               (x2, y2), (0, 255, 0), 2)
 
                         # Queue for recognition if not yet processed or
                         # cooldown elapsed
                         with self._processed_tracks_lock:
                             already_processed = track_id in self.processed_tracks
                         if not already_processed:
-                            try:
-                                self.recognition_queue.put_nowait(
-                                    (path, track_id, human_crop.copy(),
-                                     region_data))
-                            except queue.Full:
-                                logging.debug(
-                                    f"cam{self.camera_id}: recognition "
-                                    f"queue full, dropping track {track_id}")
+                            self._queue_track(
+                                track_id,
+                                (path, track_id, human_crop.copy(),
+                                 region_data))
 
                         # Get face info
                         with self.face_info_lock:
@@ -799,12 +933,12 @@ class CameraManager:
 
                         if face_bbox:
                             fx1, fy1, fx2, fy2 = face_bbox
-                            cv2.rectangle(
-                                processed_frame,
-                                (x1 + fx1, y1 + fy1),
-                                (x1 + fx2, y1 + fy2),
-                                (0, 0, 255), 2
-                            )
+                            # cv2.rectangle(
+                            #     processed_frame,
+                            #     (x1 + fx1, y1 + fy1),
+                            #     (x1 + fx2, y1 + fy2),
+                            #     (0, 0, 255), 2
+                            # )
                             cv2.putText(
                                 processed_frame, label, (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2
@@ -866,8 +1000,31 @@ class CameraManager:
         with self._cache_lock:
             for tid in stale:
                 self.embedding_cache.pop(tid, None)
+        with self._track_obs_lock:
+            for tid in stale:
+                self.track_obs.pop(tid, None)
         for tid in stale:
             self.last_seen.pop(tid, None)
+
+    def _queue_track(self, track_id, item):
+        """Store the newest pending crop for *track_id* (never blocks).
+
+        Overwriting is intentional: the worker only needs the latest frame
+        of a person, so a slow recognition pass can never make this
+        producer drop anybody.
+        """
+        with self._pending_lock:
+            self._pending_tracks[track_id] = item
+        self._pending_event.set()
+
+    def _take_pending(self, timeout=0.05):
+        """Wait up to *timeout* and return every pending track's newest item."""
+        self._pending_event.wait(timeout)
+        self._pending_event.clear()
+        with self._pending_lock:
+            items = list(self._pending_tracks.values())
+            self._pending_tracks.clear()
+        return items
 
     def recognition_worker(self):
         """Background worker for face recognition with batch queue draining"""
@@ -875,29 +1032,33 @@ class CameraManager:
 
         while not self.stop_event.is_set():
             try:
-                item = self.recognition_queue.get(timeout=0.05)
-                if item is None:
-                    break
+                pending = self._take_pending(0.05)
+                if not pending:
+                    continue
 
-                # Drain queue, keep only latest per track_id (dedup)
-                latest_items = {item[1]: item}
-                while not self.recognition_queue.empty():
-                    try:
-                        next_item = self.recognition_queue.get_nowait()
-                        if next_item is None:
-                            break
-                        latest_items[next_item[1]] = next_item
-                    except queue.Empty:
-                        break
+                for path, track_id, face_img, region_data in pending:
+                    now = time.time()
 
-                for path, track_id, face_img, region_data in latest_items.values():
-                    # Throttle: skip if this track was recently recognised
-                    with self.face_info_lock:
-                        if (track_id in self.face_info and
-                                time.time() - self.face_info[track_id]['last_update'] < RECOGNITION_UPDATE_INTERVAL):
-                            PERF_STATS.add(
-                                f"cam{self.camera_id}:skip_throttled", 0.0)
-                            continue
+                    # Per-track throttle + observation buffer.  Unlike the
+                    # old code (one recognition per track, ever) we collect
+                    # several quality observations and vote on them, so a
+                    # single blurred/occluded frame cannot decide an
+                    # identity.  Only this worker thread mutates `state`;
+                    # the lock only protects the map itself.
+                    with self._track_obs_lock:
+                        state = self.track_obs.get(track_id)
+                        if state is None:
+                            state = {'obs': [], 'attempts': 0,
+                                     'last_attempt': 0.0, 'committed': False}
+                            self.track_obs[track_id] = state
+                    if state['committed']:
+                        continue
+                    if now - state['last_attempt'] < OBS_INTERVAL:
+                        PERF_STATS.add(
+                            f"cam{self.camera_id}:skip_throttled", 0.0)
+                        continue
+                    state['last_attempt'] = now
+                    state['attempts'] += 1
 
                     _t0 = time.perf_counter()
                     if self.face_handler is not None:
@@ -917,134 +1078,320 @@ class CameraManager:
                         PERF_STATS.add(
                             f"cam{self.camera_id}:face", time.perf_counter() - _t1)
 
-                    if faces:
-                        # A person crop can contain background faces;
-                        # the largest one is the tracked subject.
-                        if len(faces) > 1:
-                            logging.debug(
-                                f"cam{self.camera_id}: {len(faces)} faces in "
-                                f"track {track_id} crop, selecting largest")
-                        face = select_primary_face(faces)
-
-                        fx1, fy1, fx2, fy2 = map(int, face.bbox)
-                        if min(fx2 - fx1, fy2 - fy1) < MIN_FACE_PX:
-                            PERF_STATS.add(
-                                f"cam{self.camera_id}:skip_small_face", 0.0)
-                            self.update_face_info(
-                                track_id, "Unknown", 0.0, 'None', 'None', '', '', None
-                            )
-                            continue
-
-                        gender = 'female' if face.gender == 0 else 'male'
-                        age = face.age
-                       
-                        det_score = float(face.det_score)
-                        if det_score > self.config.score:
-                            name, sim, gender, age, role ,socialnumber= self.recognize_face(
-                                face.embedding, gender, age
-                            )
-
-                            x1, y1, x2, y2 = map(int, face.bbox)
-
-                            self.update_face_info(
-                                track_id, name, sim, gender, age, role, socialnumber, (
-                                    x1, y1, x2, y2)
-                            )
-                            with self._cache_lock:
-                                self.embedding_cache[track_id] = face.embedding
-
-                            height_f, width_f = face_img.shape[:2]
-                            padding = self.config.padding
-                            fx1_padded = max(x1 - padding, 0)
-                            fy1_padded = max(y1 - padding, 0)
-                            fx2_padded = min(x2 + padding, width_f)
-                            fy2_padded = min(y2 + padding, height_f)
-
-                            cropped_face = face_img[fy1_padded:fy2_padded,
-                                                    fx1_padded:fx2_padded]
-
-                            try:
-                                read_idx = self.capture_read_idx
-                                current_full_frame = self.capture_buffer[read_idx]
-                                full_frame_copy = current_full_frame.copy() if current_full_frame is not None else None
-                                # DB insert submitted to the dedicated DbWorker
-                                # so it never blocks the recognition or video
-                                # pipeline even if PocketBase is slow.
-                                submit_db_task(
-                                    insertToDb, name, full_frame_copy,
-                                    cropped_face, face_img, det_score,
-                                    track_id, gender, age, role, socialnumber, path,
-                                    self.config.quality, region_data,
-                                    self.config.isRelay, self.config.isRegionMode,
-                                    self.config.ip_relay, self.config.ip_port,
-                                    self.config.relayN1, self.config.relayN2)
-                                with self._processed_tracks_lock:
-                                    self.processed_tracks.add(track_id)
-                            except Exception as e:
-                                logging.error(f"Error queueing DB insert: {e}")
-                        else:
-                            self.update_face_info(
-                                track_id, "Unknown", 0.0, 'None', 'None','', '', None
-                            )
-                    else:
+                    if not faces:
                         self.update_face_info(
-                            track_id, "Unknown", 0.0, 'None', 'None', '','', None
+                            track_id, "Unknown", 0.0, 'None', 'None', '', '', None
                         )
+                        self._give_up_if_exhausted(
+                            track_id, state, path, face_img, region_data,
+                            None, 0.0)
+                        continue
+
+                    # A person crop can contain background faces;
+                    # the largest one is the tracked subject.
+                    if len(faces) > 1:
+                        logging.debug(
+                            f"cam{self.camera_id}: {len(faces)} faces in "
+                            f"track {track_id} crop, selecting largest")
+                    face = select_primary_face(faces)
+
+                    x1, y1, x2, y2 = map(int, face.bbox)
+                    if min(x2 - x1, y2 - y1) < get_min_face_px(self.config):
+                        PERF_STATS.add(
+                            f"cam{self.camera_id}:skip_small_face", 0.0)
+                        self.update_face_info(
+                            track_id, "Unknown", 0.0, 'None', 'None', '', '', None
+                        )
+                        self._give_up_if_exhausted(
+                            track_id, state, path, face_img, region_data,
+                            (x1, y1, x2, y2), 0.0)
+                        continue
+
+                    gender = 'female' if face.gender == 0 else 'male'
+                    age = face.age
+
+                    det_score = float(face.det_score)
+                    if det_score <= self.config.score:
+                        self.update_face_info(
+                            track_id, "Unknown", 0.0, 'None', 'None', '', '', None
+                        )
+                        self._give_up_if_exhausted(
+                            track_id, state, path, face_img, region_data,
+                            (x1, y1, x2, y2), det_score)
+                        continue
+
+                    h_img, w_img = face_img.shape[:2]
+                    face_crop = face_img[max(y1, 0):min(y2, h_img),
+                                         max(x1, 0):min(x2, w_img)]
+                    blur = face_blur_score(face_crop)
+                    yaw = face_yaw(face)
+
+                    name, sim, margin, gender, age, role, socialnumber, pid = (
+                        self.recognize_face(face.embedding, gender, age))
+
+                    self.update_face_info(
+                        track_id, name, sim, gender, age, role, socialnumber,
+                        (x1, y1, x2, y2), margin=margin, person_id=pid,
+                        blur=blur, yaw=yaw, obs=len(state['obs'])
+                    )
+                    with self._cache_lock:
+                        self.embedding_cache[track_id] = face.embedding
+
+                    # Quality gate: only sharp, frontal, confident frames
+                    # count as evidence for the vote.
+                    min_blur = float(getattr(
+                        self.config, 'minBlur', DEFAULT_MIN_BLUR))
+                    max_yaw = float(getattr(
+                        self.config, 'maxYaw', DEFAULT_MAX_YAW))
+                    if blur < min_blur or abs(yaw) > max_yaw:
+                        PERF_STATS.add(f"cam{self.camera_id}:skip_quality", 0.0)
+                        logging.debug(
+                            f"cam{self.camera_id}: track {track_id} rejected "
+                            f"(blur={blur:.1f}<{min_blur} yaw={yaw:.1f}"
+                            f" vs {max_yaw})")
+                        self._give_up_if_exhausted(
+                            track_id, state, path, face_img, region_data,
+                            (x1, y1, x2, y2), det_score)
+                        continue
+
+                    state['obs'].append({
+                        'pid': pid, 'name': name, 'sim': float(sim),
+                        'margin': float(margin), 'gender': gender, 'age': age,
+                        'role': role, 'socialnumber': socialnumber,
+                        'det': det_score, 'blur': blur, 'yaw': yaw,
+                    })
+
+                    fused = self._fuse_observations(state['obs'])
+                    if fused is None:
+                        continue
+                    self.update_face_info(
+                        track_id, fused['name'], fused['sim'], fused['gender'],
+                        fused['age'], fused['role'], fused['socialnumber'],
+                        (x1, y1, x2, y2), margin=fused['margin'],
+                        person_id=fused['pid'], blur=blur, yaw=yaw,
+                        obs=fused['n']
+                    )
+
+                    if not self._fusion_is_decisive(fused):
+                        self._give_up_if_exhausted(
+                            track_id, state, path, face_img, region_data,
+                            (x1, y1, x2, y2), det_score)
+                        continue
+
+                    self._commit_track(
+                        track_id, state, fused, path, face_img, region_data,
+                        det_score, (x1, y1, x2, y2))
 
             except queue.Empty:
                 continue
         logging.info(f"Recognition worker stopped for cam{self.camera_id}")
 
-    def recognize_face(self, embedding, fgender, fage):
-        """Recognize face using batch vectorized cosine similarity.
+    # ------------------------------------------------------------------
+    #  Temporal fusion: several observations -> one committed identity
+    # ------------------------------------------------------------------
 
-        The embedding_index is an atomic tuple (matrix, labels) swap;
-        readers never need a lock because Python's GIL guarantees atomic
-        tuple reads, and writers publish a complete new tuple.
+    @staticmethod
+    def _fuse_observations(obs):
+        """Majority-vote the per-frame identity decisions of one track.
 
-        Uses ``max()`` aggregation across all reference embeddings per
-        person so multiple reference images improve recognition.
+        Returns None when there is nothing to fuse.  ``sim`` is the mean
+        similarity across the winning identity's frames and ``margin`` the
+        gap to the best competing identity (or a large value when nobody
+        competed).
         """
-        # Single tuple read = atomic snapshot of matrix + labels
-        matrix, labels = self.config.embedding_index
-        if matrix.shape[0] == 0:
-            return "unknown", 0.0, fgender, fage, '', ''
+        if not obs:
+            return None
+        groups = {}
+        for o in obs:
+            key = o.get('pid') or ''
+            g = groups.get(key)
+            if g is None:
+                g = groups[key] = {'n': 0, 'sum': 0.0, 'first': o}
+            g['n'] += 1
+            g['sum'] += o['sim']
 
-        query = embedding.astype(np.float32)
+        winner_key = max(groups, key=lambda k: (groups[k]['n'], groups[k]['sum']))
+        winner = groups[winner_key]
+        others = [g for k, g in groups.items() if k != winner_key]
+        other_sim = max((g['sum'] / g['n'] for g in others), default=-1.0)
+        sim = winner['sum'] / winner['n']
+        first = winner['first']
+        return {
+            'pid': first.get('pid', ''), 'name': first['name'],
+            'gender': first['gender'], 'age': first['age'],
+            'role': first['role'], 'socialnumber': first['socialnumber'],
+            'sim': float(sim), 'margin': float(sim - other_sim),
+            'n': winner['n'], 'total': len(obs),
+            'ratio': winner['n'] / len(obs),
+            'blur': first.get('blur', 0.0), 'yaw': first.get('yaw', 0.0),
+        }
+
+    @staticmethod
+    def _min_observations(vote_obs: int) -> int:
+        """Observations needed before a unanimous track may be trusted."""
+        return max(2, min(int(vote_obs), 3))
+
+    def _fusion_is_decisive(self, fused) -> bool:
+        """True when enough independent observations agree on one identity."""
+        vote_obs = int(getattr(self.config, 'voteObs', DEFAULT_VOTE_OBS))
+        majority = float(getattr(
+            self.config, 'voteMajority', DEFAULT_VOTE_MAJORITY))
+        if fused['n'] < self._min_observations(vote_obs):
+            return False
+        if fused['ratio'] < majority:
+            return False
+        if fused['pid']:
+            # A known identity must also clear the similarity and margin
+            # gates: the mean can dip below the per-frame threshold when
+            # later frames are worse, and a tight margin means two known
+            # people were fighting over the same frames.
+            if fused['sim'] < self.config.simscore:
+                return False
+            if fused['margin'] < float(getattr(
+                    self.config, 'marginMin', DEFAULT_MARGIN_MIN)):
+                return False
+        return True
+
+    def _give_up_if_exhausted(self, track_id, state, path, face_img,
+                              region_data, bbox, det_score):
+        """Settle a track that never became decisive.
+
+        Without this, a track whose frames are all rejected (blurry,
+        extreme pose) would keep the recognition queue busy until it went
+        stale.  The result is recorded as 'unknown' rather than as the
+        most-voted identity, because an undecided track must not assert an
+        identity.
+        """
+        if state['committed']:
+            return
+        vote_obs = int(getattr(self.config, 'voteObs', DEFAULT_VOTE_OBS))
+        cap = max(self._min_observations(vote_obs) * 4, vote_obs * 2)
+        if state['attempts'] < cap:
+            return
+
+        fused = self._fuse_observations(state['obs'])
+        if fused is None or not self._fusion_is_decisive(fused):
+            logging.info(
+                f"cam{self.camera_id}: track {track_id} undecided after "
+                f"{state['attempts']} attempts / {len(state['obs'])} "
+                f"observations -> recorded as unknown")
+            fused = {
+                'pid': '', 'name': 'unknown', 'gender': 'None', 'age': 'None',
+                'role': '', 'socialnumber': '', 'sim': 0.0, 'margin': 0.0,
+                'n': 0, 'total': len(state['obs']), 'ratio': 0.0,
+                'blur': 0.0, 'yaw': 0.0,
+            }
+        # Only log when we actually saw a face (det_score > 0); otherwise
+        # a track that never produced one would leave a 0-confidence row.
+        log_bbox = bbox if det_score and det_score > 0 else None
+        self._commit_track(
+            track_id, state, fused, path, face_img, region_data,
+            det_score, log_bbox)
+
+    def _commit_track(self, track_id, state, fused, path, face_img,
+                      region_data, det_score, bbox):
+        """Log the settled identity once and stop re-queueing this track."""
+        if state['committed']:
+            return
+        state['committed'] = True
+        with self._processed_tracks_lock:
+            self.processed_tracks.add(track_id)
+
+        if bbox is None:
+            return
+
+        try:
+            
+            x1, y1, x2, y2 = bbox
+            height_f, width_f = face_img.shape[:2]
+            padding = 40
+            fx1_padded = max(x1 - padding, 0)
+            fy1_padded = max(y1 - padding, 0)
+            fx2_padded = min(x2 + padding, width_f)
+            fy2_padded = min(y2 + padding, height_f)
+
+            cropped_face = face_img[fy1_padded:fy2_padded,
+                                    fx1_padded:fx2_padded]
+
+            read_idx = self.capture_read_idx
+            current_full_frame = self.capture_buffer[read_idx]
+            full_frame_copy = (current_full_frame.copy()
+                               if current_full_frame is not None else None)
+            # DB insert submitted to the dedicated DbWorker so it never
+            # blocks the recognition or video pipeline even if PocketBase
+            # is slow.
+            submit_db_task(
+                insertToDb, fused['name'], full_frame_copy,
+                cropped_face, face_img, det_score,
+                track_id, fused['gender'], fused['age'], fused['role'],
+                fused['socialnumber'], path,
+                self.config.quality, region_data,
+                self.config.isRelay, self.config.isRegionMode,
+                self.config.ip_relay, self.config.ip_port,
+                self.config.relayN1, self.config.relayN2,
+                sim=fused['sim'], margin=fused['margin'],
+                obs_count=fused['n'], person_id=fused['pid'],
+                blur=fused['blur'], yaw=fused['yaw'], det_score=det_score)
+        except Exception as e:
+            logging.error(f"Error queueing DB insert: {e}")
+
+    def recognize_face(self, embedding, fgender, fage):
+        """Best identity for a single frame, plus an ambiguity margin.
+
+        Returns ``(name, sim, margin, gender, age, role, socialnumber,
+        person_id)``.
+
+        Reference rows are grouped by person at index-build time, so the
+        per-person score is a max over that person's images computed with
+        ``np.maximum.reduceat`` - no per-frame Python loop over the whole
+        gallery.  ``margin`` is best-minus-second *distinct person*; a
+        small value means two known people were fighting over this frame,
+        which is what the caller uses to refuse a confident-looking match.
+
+        The embedding_index is an atomic tuple swap; readers never need a
+        lock because tuple reads are atomic and writers publish a complete
+        new tuple.
+        """
+        matrix, person_labels, person_starts = self.config.embedding_index
+        if matrix.shape[0] == 0 or not person_labels:
+            return "unknown", 0.0, 1.0, fgender, fage, '', '', ''
+
+        query = np.asarray(embedding, dtype=np.float32)
         query_norm = np.linalg.norm(query)
         if query_norm > 0:
             query = query / query_norm
 
         sims = matrix @ query
+        person_sims = np.maximum.reduceat(sims, person_starts)
 
-        # Aggregate by person: max similarity across all their embeddings
-        best_sim = -1.0
-        best_label = None
-        second_sim = -1.0
-        for i, sim_val in enumerate(sims):
-            s = float(sim_val)
-            if s > best_sim:
-                second_sim = best_sim
-                best_sim = s
-                best_label = labels[i]
-            elif s > second_sim:
-                second_sim = s
+        order = np.argsort(person_sims)[::-1]
+        best_i = int(order[0])
+        best_sim = float(person_sims[best_i])
+        second_sim = (float(person_sims[int(order[1])])
+                      if order.size > 1 else -1.0)
+        margin = best_sim - second_sim
+
+        name, age, gender, role, socialnumber, pid, override = (
+            person_labels[best_i])
+        thr = float(override) if override else float(self.config.simscore)
+        if thr <= 0:
+            thr = float(self.config.simscore)
 
         # Debug-level diagnosis for "why wasn't this face recognised?"
         # (enable with logging level DEBUG; no per-frame INFO spam).
         logging.debug(
-            f"recognize_face: best={best_sim:.4f} "
-            f"({best_label[0] if best_label else 'none'}) "
-            f"second={second_sim:.4f} thr={self.config.simscore} "
-            f"refs={matrix.shape[0]}")
+            f"recognize_face: best={best_sim:.4f} ({name}) "
+            f"second={second_sim:.4f} margin={margin:.4f} thr={thr} "
+            f"persons={len(person_labels)} refs={matrix.shape[0]}")
 
-        if best_sim >= self.config.simscore and best_label is not None:
-            name, age, gender, role, socialnumber = best_label
-            return name, best_sim, gender, age, role, socialnumber
+        if best_sim >= thr:
+            return name, best_sim, margin, gender, age, role, socialnumber, pid
 
-        return "unknown", max(best_sim, 0.0), fgender, fage, '', ''
+        return "unknown", max(best_sim, 0.0), margin, fgender, fage, '', '', ''
 
-    def update_face_info(self, track_id, name, score, gender, age, role, socialnumber, bbox=None):
+    def update_face_info(self, track_id, name, score, gender, age, role,
+                         socialnumber, bbox=None, margin=0.0, person_id='',
+                         blur=0.0, yaw=0.0, obs=0):
         """Thread-safe update of face information"""
         with self.face_info_lock:
             self.face_info[track_id] = {
@@ -1055,7 +1402,12 @@ class CameraManager:
                 'gender': gender,
                 'age': age,
                 'role': role,
-                'socialnumber': socialnumber
+                'socialnumber': socialnumber,
+                'margin': margin,
+                'person_id': person_id,
+                'blur': blur,
+                'yaw': yaw,
+                'obs': obs,
             }
 
     def release_resources(self, role=False):

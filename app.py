@@ -37,6 +37,7 @@ from savatoDb import (
     add_embedding_to_person, remove_person_embedding,
     delete_person_from_db, get_person_faces,
     extract_face_embedding, validate_face_embedding,
+    build_embedding_meta, face_blur_score, face_yaw, get_min_face_px,
 )
 
 # Configure logging
@@ -401,17 +402,20 @@ def _detect_faces_two_stage(frame):
     face dicts with bbox coordinates in the original full-image space.
     """
     detected_faces = []
-    min_face_px = int(os.getenv("MIN_FACE_PX", "64"))
+    min_face_px = get_min_face_px(cctv_monitor)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # cv2.imshow('frame',frame)
+    # cv2.waitKey(0)
 
     # Stage 1: YOLO person detection
     if cctv_monitor and cctv_monitor.model is not None:
         with cctv_monitor.model_lock:
-            yolo_results = cctv_monitor.model(frame, classes=[0], device=device)
+            yolo_results = cctv_monitor.model.predict(frame, classes=[0], device=device)
         person_boxes = []
         for r in yolo_results:
             if r.boxes is not None:
                 for box in r.boxes:
+               
                     x1, y1, x2, y2 = map(int, box.xyxy[0][:4])
                     person_boxes.append((x1, y1, x2, y2))
         # Fallback: if YOLO found no persons, try the full image
@@ -437,6 +441,7 @@ def _detect_faces_two_stage(frame):
             continue
 
         person_crop = frame[py1:py2, px1:px2]
+       
         with _crop_face_lock:
             faces = face_handler.get(person_crop)
 
@@ -448,6 +453,7 @@ def _detect_faces_two_stage(frame):
             face_w = fx2 - fx1
             face_h = fy2 - fy1
 
+
             if min(face_w, face_h) < min_face_px:
                 continue
 
@@ -458,12 +464,13 @@ def _detect_faces_two_stage(frame):
             abs_fy2 = py1 + fy2
 
             # Crop face with padding for the preview thumbnail
-            pad = FACE_CROP_PADDING
+            pad = 40
             cx1 = max(abs_fx1 - pad, 0)
             cy1 = max(abs_fy1 - pad, 0)
             cx2 = min(abs_fx2 + pad, frame.shape[1])
             cy2 = min(abs_fy2 + pad, frame.shape[0])
             cropped = frame[cy1:cy2, cx1:cx2]
+          
             _, crop_encoded = cv2.imencode(".jpg", cropped)
             crop_b64 = base64.b64encode(crop_encoded.tobytes()).decode('utf-8')
 
@@ -492,8 +499,10 @@ def detect_faces(file: UploadFile = File(...)):
     detects faces within each person crop.  Bounding boxes are returned
     in full-image coordinates.
     """
+    logging.error(file.filename)
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
+    logging.error("HELLLLLLLOOOOOOOOOOOOOOOOOOOO")
 
     allowed_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
     file_extension = os.path.splitext(file.filename)[1].lower()
@@ -516,17 +525,23 @@ def detect_faces(file: UploadFile = File(...)):
         logging.info(f"detect-faces: processing {file_location}")
 
         frame = cv2.imread(file_location)
+
         if frame is None:
-            os.remove(file_location)
+            # os.remove(file_location)
             raise HTTPException(status_code=400, detail="Could not read image")
 
         detected_faces = _detect_faces_two_stage(frame)
 
         if not detected_faces:
-            os.remove(file_location)
+            # os.remove(file_location)
+            logging.error(f"No face detected in image (faces must be at "
+                       f"least {get_min_face_px(cctv_monitor)}px wide)")
             raise HTTPException(
+              
+                
                 status_code=400,
-                detail="No face detected in image")
+                detail=f"No face detected in image (faces must be at "
+                       f"least {get_min_face_px(cctv_monitor)}px wide)")
 
         height, width = frame.shape[:2]
         _, full_encoded = cv2.imencode(".jpg", frame)
@@ -575,7 +590,8 @@ def detect_faces_from_path(filePath: str):
         if not detected_faces:
             raise HTTPException(
                 status_code=400,
-                detail="No face detected in image")
+                detail=f"No face detected in image (faces must be at "
+                       f"least {get_min_face_px(cctv_monitor)}px wide)")
 
         height, width = frame.shape[:2]
         _, full_encoded = cv2.imencode(".jpg", frame)
@@ -627,7 +643,7 @@ def register_selected_face(data: RegisterFaceFields):
 
         # Re-run two-stage detection to get face embeddings (must match
         # the indices returned by /detect-faces).
-        min_face_px = int(os.getenv("MIN_FACE_PX", "64"))
+        min_face_px = get_min_face_px(cctv_monitor)
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
         # Stage 1: YOLO person detection
@@ -664,7 +680,9 @@ def register_selected_face(data: RegisterFaceFields):
             for face in faces:
                 fx1, fy1, fx2, fy2 = map(int, face.bbox)
                 if min(fx2 - fx1, fy2 - fy1) >= min_face_px:
-                    valid_faces.append(face)
+                    # face.bbox is relative to the person crop; remember the
+                    # crop origin so the absolute box can be rebuilt later.
+                    valid_faces.append((face, px1, py1))
 
         if not valid_faces:
             raise HTTPException(
@@ -677,8 +695,22 @@ def register_selected_face(data: RegisterFaceFields):
                 detail=f"Invalid face index {data.faceIndex}. "
                        f"Valid range: 0-{len(valid_faces) - 1}")
 
-        selected_face = valid_faces[data.faceIndex]
+        selected_face, crop_x, crop_y = valid_faces[data.faceIndex]
         embedding = selected_face.embedding
+
+        # Quality record for this reference vector: stored next to
+        # embdanings in embeddingMeta so a later audit can see how sharp /
+        # frontal the photo that produced the vector actually was.
+        ax1, ay1, ax2, ay2 = map(int, selected_face.bbox)
+        fh, fw = frame.shape[:2]
+        abs_x1, abs_y1 = crop_x + ax1, crop_y + ay1
+        abs_x2, abs_y2 = crop_x + ax2, crop_y + ay2
+        face_crop = frame[max(abs_y1, 0):min(abs_y2, fh),
+                          max(abs_x1, 0):min(abs_x2, fw)]
+        meta = build_embedding_meta(
+            face_blur_score(face_crop),
+            float(getattr(selected_face, "det_score", 0.0) or 0.0),
+            face_yaw(selected_face))
 
         if not validate_face_embedding(embedding):
             raise HTTPException(
@@ -702,7 +734,8 @@ def register_selected_face(data: RegisterFaceFields):
             face_handler=_get_crop_face_handler(),
             face_lock=_crop_face_lock,
             model=cctv_monitor.model if cctv_monitor else None,
-            model_lock=cctv_monitor.model_lock if cctv_monitor else None)
+            model_lock=cctv_monitor.model_lock if cctv_monitor else None,
+            meta=meta)
 
         if ok and cctv_monitor:
             cctv_monitor.refresh_person(data.name)
@@ -764,6 +797,7 @@ def insert_known_person(data: KnownPersonFields):
             cctv_monitor.model_lock,
             userwhom=data.userwhom,
             description=data.description,
+            min_face_px=get_min_face_px(cctv_monitor),
         )
 
         # Refresh known names in CCTV monitor (incremental: only the
@@ -827,6 +861,7 @@ def insert_known_person_multi(data: MultiImagePersonFields):
             cctv_monitor.model_lock,
             userwhom=data.userwhom,
             description=data.description,
+            min_face_px=get_min_face_px(cctv_monitor),
         )
 
         # Refresh known names in CCTV monitor
@@ -881,11 +916,12 @@ def add_face_reference(data: AddFaceReferenceFields):
         logging.info(
             f"Adding face reference for '{data.name}': {image_path}")
 
-        min_face_px = int(os.getenv("MIN_FACE_PX", "64"))
-        embedding = extract_face_embedding(
+        min_face_px = get_min_face_px(cctv_monitor)
+        embedding, meta = extract_face_embedding(
             image_path, cctv_monitor.face_handler,
             cctv_monitor.face_lock, cctv_monitor.model,
-            cctv_monitor.model_lock, device, min_face_px)
+            cctv_monitor.model_lock, device, min_face_px,
+            return_meta=True)
 
         if embedding is None:
             raise HTTPException(
@@ -914,7 +950,8 @@ def add_face_reference(data: AddFaceReferenceFields):
             face_handler=_get_crop_face_handler(),
             face_lock=_crop_face_lock,
             model=cctv_monitor.model if cctv_monitor else None,
-            model_lock=cctv_monitor.model_lock if cctv_monitor else None)
+            model_lock=cctv_monitor.model_lock if cctv_monitor else None,
+            meta=meta)
 
         if ok and cctv_monitor:
             cctv_monitor.refresh_person(data.name)
