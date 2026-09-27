@@ -163,7 +163,7 @@ def bench_concurrency(crop, calls_per_thread, threads, providers):
 
 
 def bench_rtsp(source, seconds=15):
-    from newcamera import FreshestFrame
+    from olderTests.newcamera import FreshestFrame
     logging.info(f"Probing RTSP decode rate for {seconds}s: {source}")
     fresh = FreshestFrame(source)
     seq_start = fresh.latestnum

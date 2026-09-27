@@ -20,8 +20,8 @@ from insightface.app import FaceAnalysis
 from sklearn.metrics.pairwise import cosine_similarity
 import torch
 from concurrent.futures import ThreadPoolExecutor
-from newcamera import FreshestFrame
-from newsavatoDb import load_embeddings_from_db, insertToDb
+from camera import FreshestFrame
+from savatoDb import load_embeddings_from_db, insertToDb
 from PIL import Image
 from torchvision.transforms import transforms
 import json
@@ -53,7 +53,7 @@ JPEG_QUALITY = 85
 class CCtvMonitor:
     def __init__(self,device):
         self.process = None
-        self.start()
+        # self.start()
         self.device = device
         self.frps = 5 if self.device == 'cuda' else 25
         self.fileEx = 'onnx' if self.checkOnnx() else 'pt'

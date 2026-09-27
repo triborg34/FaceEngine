@@ -21,9 +21,9 @@ import requests
 import uvicorn
 import multiprocessing
 # Import your improved CCtvMonitor class
-from newengine import CCtvMonitor, image_crop,CameraManager,sendRegularFrames,takeFrame
+from engine import CCtvMonitor, image_crop,CameraManager,sendRegularFrames,takeFrame
 from onvifmaneger import get_rtsp_url
-from newsavatoDb import reciveFromUi
+from savatoDb import reciveFromUi
 
 # Configure logging
 logging.basicConfig(

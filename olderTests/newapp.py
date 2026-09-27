@@ -24,14 +24,14 @@ import multiprocessing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue, Empty
 # Import your improved CCtvMonitor class
-from newengine import (
+from olderTests.newengine import (
     CCtvMonitor, image_crop, CameraManager, sendRegularFrames, takeFrame,
     _get_crop_face_handler, _crop_face_lock, FACE_CROP_PADDING,
 )
 from onvifmaneger import get_rtsp_url
 import urllib.request
 
-from newsavatoDb import (
+from olderTests.newsavatoDb import (
     reciveFromUi, reciveFromUi_multi, init_db_session,
     shutdown_relay_executor, get_db_worker,
     add_embedding_to_person, remove_person_embedding,
@@ -717,7 +717,7 @@ def register_selected_face(data: RegisterFaceFields):
                 status_code=400, detail="Invalid face embedding generated")
 
         # Fetch existing person data to preserve fields
-        from newsavatoDb import find_person_record
+        from olderTests.newsavatoDb import find_person_record
         record = find_person_record(data.name)
         if not record:
             raise HTTPException(
@@ -933,7 +933,7 @@ def add_face_reference(data: AddFaceReferenceFields):
                 status_code=400, detail="Invalid face embedding generated")
 
         # Fetch existing person data for age/gender/role/socialnumber
-        from newsavatoDb import find_person_record
+        from olderTests.newsavatoDb import find_person_record
         record = find_person_record(data.name)
         if not record:
             raise HTTPException(
@@ -1058,7 +1058,7 @@ async def delete_known_person(person_name: str):
             raise HTTPException(
                 status_code=503, detail="CCTV Monitor not initialized")
 
-        from newsavatoDb import delete_person_from_db
+        from olderTests.newsavatoDb import delete_person_from_db
         ok = delete_person_from_db(person_name)
 
         if ok and cctv_monitor:

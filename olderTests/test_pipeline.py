@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from newsavatoDb import (
+from olderTests.newsavatoDb import (
     parse_embeddings_field,
     select_primary_face,
     face_blur_score,
@@ -130,7 +130,7 @@ def _config(matrix, labels, starts, thr=0.6, **extra):
 
 def _recognize(cfg, query, thr=None):
     """Drive the REAL CameraManager.recognize_face against a stub config."""
-    from newengine import CameraManager
+    from olderTests.newengine import CameraManager
     if thr is not None:
         cfg.simscore = thr
     cm = CameraManager.__new__(CameraManager)
@@ -224,12 +224,12 @@ def _obs(pid, name, sim, **kw):
 
 
 def _fusion(obs):
-    from newengine import CameraManager
+    from olderTests.newengine import CameraManager
     return CameraManager._fuse_observations(obs)
 
 
 def _decisive(fused, vote_obs=5, majority=0.6, simscore=0.6, margin_min=0.06):
-    from newengine import CameraManager
+    from olderTests.newengine import CameraManager
     from types import SimpleNamespace
     cfg = SimpleNamespace(voteObs=vote_obs, voteMajority=majority,
                           simscore=simscore, marginMin=margin_min)
@@ -287,7 +287,7 @@ def test_fusion_empty():
 
 
 def test_embedding_meta_helpers():
-    from newsavatoDb import (build_embedding_meta, parse_embedding_meta,
+    from olderTests.newsavatoDb import (build_embedding_meta, parse_embedding_meta,
                           fit_meta_length, face_yaw, EMBEDDING_MODEL)
     m = build_embedding_meta(142.3, 0.91, -8.2)
     assert m['model'] == EMBEDDING_MODEL and m['blur'] == 142.3
@@ -311,7 +311,7 @@ def test_setting_gates_ignore_zeroed_columns():
     with 0; with yaw stored as 0 the worker rejected every frame
     (abs(yaw) > 0 is always true) and nothing could ever be recognised.
     """
-    from newengine import (resolve_setting_gates, DEFAULT_MARGIN_MIN,
+    from olderTests.newengine import (resolve_setting_gates, DEFAULT_MARGIN_MIN,
                         DEFAULT_VOTE_OBS, DEFAULT_VOTE_MAJORITY,
                         DEFAULT_MIN_BLUR, DEFAULT_MAX_YAW, DEFAULT_MIN_FACE_PX)
     zeroed = resolve_setting_gates({
@@ -353,7 +353,7 @@ def test_min_face_px_resolution():
     person across scales at 0.69-0.88.
     """
     import os
-    from newsavatoDb import get_min_face_px, DEFAULT_MIN_FACE_PX
+    from olderTests.newsavatoDb import get_min_face_px, DEFAULT_MIN_FACE_PX
     had_env = "MIN_FACE_PX" in os.environ
     saved = os.environ.get("MIN_FACE_PX")
     try:
@@ -384,7 +384,7 @@ def test_min_face_px_resolution():
 def _bare_manager():
     """A CameraManager with only the state the worker touches."""
     import threading
-    from newengine import CameraManager
+    from olderTests.newengine import CameraManager
     cm = CameraManager.__new__(CameraManager)
     cm.camera_id = 9
     cm.running = True
@@ -455,8 +455,8 @@ def test_worker_recognises_two_tracks():
     """
     import time
     import threading
-    import newengine
-    from newengine import CameraManager
+    import olderTests.newengine as newengine
+    from olderTests.newengine import CameraManager
 
     q_alice, q_bob = _unit(101), _unit(202)
     refs = [(("Alice", "", "", "", "", "idA", None), [_ref_at(0.99, q_alice, 301)]),
