@@ -6,7 +6,7 @@ import time
 import cv2
 import numpy as np
 import threading
-from camera import FreshestFrame
+from newcamera import FreshestFrame
 import queue
 import requests
 from ultralytics import YOLO

@@ -22,7 +22,7 @@ from insightface.app import FaceAnalysis
 import torch
 from concurrent.futures import ThreadPoolExecutor
 from camera import FreshestFrame
-from savatoDb import (
+from newsavatoDb import (
     load_embeddings_from_db, load_person_from_db, insertToDb,
     get_db_worker, submit_db_task, select_primary_face,
     face_blur_score, face_yaw, get_min_face_px, DEFAULT_MIN_FACE_PX,

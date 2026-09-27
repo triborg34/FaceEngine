@@ -15,7 +15,7 @@ import asyncio
 import websockets
 from threading import Lock
 
-from camera import FreshestFrame
+from newcamera import FreshestFrame
 
 
 RTSP_URL="rtsp://admin:123456@192.168.1.245:554/stream"
