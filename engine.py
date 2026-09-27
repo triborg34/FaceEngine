@@ -53,7 +53,7 @@ JPEG_QUALITY = 85
 class CCtvMonitor:
     def __init__(self,device):
         self.process = None
-        # self.start()
+        self.start()
         self.device = device
         self.frps = 5 if self.device == 'cuda' else 25
         self.fileEx = 'onnx' if self.checkOnnx() else 'pt'
@@ -65,7 +65,8 @@ class CCtvMonitor:
         self.RETRY_DELAY = 3
         self.ip_relay, self.ip_port, self.relayN1, self.relayN2 = '', '', '', ''
         self.score, self.padding, self.quality, self.hscore, self.simscore, self.port, self.isRegionMode, self.isRelay, self.iou = self.loadConfig()
-
+        self.voting_interval = 0.15   # seconds between samples while voting (faster than RECOGNITION_UPDATE_INTERVAL)
+        self.votes_required = 4       # samples needed before committing to an identity
         # Initialize models
         self.model = None
         self.face_handler = None
@@ -207,7 +208,7 @@ class CCtvMonitor:
 
             # Load face handler
             self.face_handler = FaceAnalysis(
-                'antelopev2',
+                'buffalo_l',
                 providers= ['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device=='cuda' else ['CPUExecutionProvider'],
                 root='.'
             )
@@ -340,6 +341,9 @@ class CameraManager:
         self.face_info = {}
         self.face_info_lock = threading.Lock()
         self.embedding_cache = {}
+        self.last_queued_at = {}       # track_id -> last time it was queued for recognition
+        self.track_votes = {}          # track_id -> list of pending recognition samples
+        self.track_decided = set()     # track_ids that have a locked-in identity
         
         if self.config.isRegionMode:
             self.background_subtractor = cv2.createBackgroundSubtractorMOG2()
@@ -491,36 +495,34 @@ class CameraManager:
     def process_frame(self):
         last_capture_version = -1
         """Process a single frame for object detection and face recognition"""
-        while self.running :
+        while self.running:
             try:
-
                 item = self.frame_queue.get(timeout=0.05)
             except queue.Empty:
                 if not self.running:
                     break
                 continue
-
+ 
             if item is None:
                 logging.info("process_frame shutdown signal received")
                 break
             path, counter, regions = item
             current_capture_version = self.capture_version
-            
+ 
             # Skip if same frame
             if current_capture_version == last_capture_version:
                 continue
-            
+ 
             last_capture_version = current_capture_version
-            
+ 
             # Read from stable read buffer
             read_idx = self.capture_read_idx
             frame = self.capture_buffer[read_idx]
             if frame is None or frame.size == 0:
                 continue
-
+ 
             try:
-        
-
+ 
                 start_time = time.time()
                 processed_frame = frame.copy()
                 if self.config.isRegionMode:
@@ -534,7 +536,7 @@ class CameraManager:
                         processed_frame, processed_frame, mask=combined_mask)
                     self.k.clear()
                     current_regions = []
-
+ 
                 # Run YOLO detection
                 results = self.config.model.track(
                     masked_frame if self.config.isRegionMode else processed_frame,
@@ -544,14 +546,17 @@ class CameraManager:
                     persist=True,
                     device=self.config.device,
                     conf=self.config.hscore,
-
                 )
-
+ 
                 for res in results:
                     if res.boxes.id is None:
                         continue
                     for i in range(len(res.boxes.xyxy)):
                         x1, y1, x2, y2 = res.boxes.xyxy[i].int().tolist()
+ 
+                        # FIX #1: region_data must always be defined before use,
+                        # even when isRegionMode is True but no region matched.
+                        region_data = None
                         if self.config.isRegionMode:
                             region_name = self.get_detection_region(
                                 (x1, y1, x2, y2), region_masks)
@@ -559,35 +564,38 @@ class CameraManager:
                                 region_data = regions[region_name]
                                 if region_data not in current_regions:
                                     current_regions.append(region_data)
-                        else:
-                            region_data = None
-
+ 
                         # Get tracking ID
-
                         track_id = int(res.boxes.id[i])
-
+ 
                         # Crop human region
-                        human_crop = masked_frame[y1:y2,
-                                                  x1:x2] if self.config.isRegionMode else processed_frame[y1:y2, x1:x2]
+                        human_crop = masked_frame[y1:y2, x1:x2] \
+                            if self.config.isRegionMode else processed_frame[y1:y2, x1:x2]
                         if human_crop.size == 0:
                             continue
-
+ 
                         # Draw bounding box
                         cv2.rectangle(processed_frame, (x1, y1),
                                       (x2, y2), (0, 255, 0), 2)
-
-                        # Queue for recognition every frps frames
-                        # if counter % self.frps == 0:
-                        if track_id not in self.processed_tracks:
+ 
+                        # FIX #2 + VOTING: time-based re-queue gate. While a track
+                        # hasn't reached a decision yet, poll fast (VOTING_INTERVAL)
+                        # to gather enough samples quickly. Once decided, fall back
+                        # to the slow periodic interval (just to refresh bbox / catch
+                        # drift), instead of never re-queuing or re-queuing every frame.
+                        now = time.time()
+                        last_queued = self.last_queued_at.get(track_id, 0)
+                        interval = (RECOGNITION_UPDATE_INTERVAL
+                                    if track_id in self.track_decided
+                                    else self.config.voting_interval)
+                        if now - last_queued >= interval:
+                            self.last_queued_at[track_id] = now
                             try:
-                                self.recognition_queue.put(
-                                    (         path,
-                                    track_id,
-                                    human_crop.copy(),
-                                    region_data))
+                                self.recognition_queue.put_nowait(
+                                    (path, track_id, human_crop.copy(), region_data))
                             except queue.Full:
                                 pass
-
+ 
                         # Get face info
                         with self.face_info_lock:
                             info = self.face_info.get(
@@ -602,11 +610,11 @@ class CameraManager:
                                     'socialnumber': ''
                                 }
                             )
-
+ 
                         # Create label
                         label = f"{info['name']} ID:{track_id}"
                         face_bbox = info['bbox']
-
+ 
                         if face_bbox:
                             fx1, fy1, fx2, fy2 = face_bbox
                             cv2.rectangle(
@@ -619,13 +627,12 @@ class CameraManager:
                                 processed_frame, label, (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2
                             )
-
                         else:
                             cv2.putText(
                                 processed_frame, label, (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2
                             )
-
+ 
                 # Calculate and display FPS
                 if self.config.isRegionMode:
                     self.k = current_regions
@@ -634,7 +641,7 @@ class CameraManager:
                         processed_frame, regions)
                 else:
                     display_frame = processed_frame
-
+ 
                 try:
                     fps = 1.0 / (time.time() - start_time)
                 except ZeroDivisionError:
@@ -645,25 +652,25 @@ class CameraManager:
                 )
                 write_idx = self.display_write_idx
                 self.display_buffer[write_idx] = display_frame
-                
+ 
                 # Swap buffers atomically
                 self.display_read_idx = write_idx
                 self.display_write_idx = 1 - write_idx
                 self.display_version += 1
-
+ 
             except Exception as e:
                 logging.error(f"Error processing frame: {e}")
-
+ 
     def recognition_worker(self):
         """Background worker for face recognition with batch queue draining"""
         logging.info("Recognition worker started.")
-
+ 
         while not self.stop_event.is_set():
             try:
                 item = self.recognition_queue.get(timeout=0.05)
                 if item is None:
                     break
-
+ 
                 # Drain queue, keep only latest per track_id
                 latest_items = {item[1]: item}
                 while not self.recognition_queue.empty():
@@ -674,85 +681,164 @@ class CameraManager:
                         latest_items[next_item[1]] = next_item
                     except queue.Empty:
                         break
-
+ 
                 for path, track_id, face_img, region_data in latest_items.values():
-                    with self.face_info_lock:
-                        if (track_id in self.face_info and
-                                time.time() - self.face_info[track_id]['last_update'] < RECOGNITION_UPDATE_INTERVAL):
-                            continue
-
+ 
+                    # Already decided: just keep bbox/display fresh, skip
+                    # re-voting and re-inserting to DB.
+                    if track_id in self.track_decided:
+                        faces = self.config.face_handler.get(face_img)
+                        if faces:
+                            face = faces[0]
+                            det_score = float(face.det_score)
+                            if det_score > self.config.score:
+                                x1, y1, x2, y2 = map(int, face.bbox)
+                                with self.face_info_lock:
+                                    existing = self.face_info.get(track_id)
+                                if existing:
+                                    self.update_face_info(
+                                        track_id, existing['name'], existing['score'],
+                                        existing['gender'], existing['age'],
+                                        existing['role'], existing['socialnumber'],
+                                        (x1, y1, x2, y2)
+                                    )
+                        continue
+ 
                     faces = self.config.face_handler.get(face_img)
-
-                    if faces:
-                        face = faces[0]
-                        gender = 'female' if face.gender == 0 else 'male'
-                        age = face.age
-                       
-                        det_score = float(face.det_score)
-                        if det_score > self.config.score:
-                            name, sim, gender, age, role ,socialnumber= self.recognize_face(
-                                face.embedding, gender, age
-                            )
-
-                            x1, y1, x2, y2 = map(int, face.bbox)
-
-                            self.update_face_info(
-                                track_id, name, sim, gender, age, role, socialnumber, (
-                                    x1, y1, x2, y2)
-                            )
-                            self.embedding_cache[track_id] = face.embedding
-
-                            height_f, width_f = face_img.shape[:2]
-                            padding = self.config.padding
-                            fx1_padded = max(x1 - padding, 0)
-                            fy1_padded = max(y1 - padding, 0)
-                            fx2_padded = min(x2 + padding, width_f)
-                            fy2_padded = min(y2 + padding, height_f)
-
-                            cropped_face = face_img[fy1_padded:fy2_padded,
-                                                    fx1_padded:fx2_padded]
-
-                            try:
-                                read_idx = self.capture_read_idx
-                                current_full_frame = self.capture_buffer[read_idx]
-                                insertToDb(name, current_full_frame.copy() if current_full_frame is not None else None, cropped_face.copy(), face_img.copy(
-                                ), det_score, track_id, gender, age, role, socialnumber, path, self.config.quality, region_data, self.config.isRelay, self.config.isRegionMode, self.config.ip_relay, self.config.ip_port, self.config.relayN1, self.config.relayN2)
-                                self.processed_tracks.add(track_id)
-                            except Exception as e:
-                                logging.error(f"Error inserting to DB: {e}")
-                        else:
-                            self.update_face_info(
-                                track_id, "Unknown", 0.0, 'None', 'None','', '', None
-                            )
-                    else:
+ 
+                    if not faces:
                         self.update_face_info(
-                            track_id, "Unknown", 0.0, 'None', 'None', '','', None
+                            track_id, "Analyzing...", 0.0, 'None', 'None', '', '', None
                         )
-
+                        continue
+ 
+                    face = faces[0]
+                    gender = 'female' if face.gender == 0 else 'male'
+                    age = face.age
+                    det_score = float(face.det_score)
+ 
+                    if det_score <= self.config.score:
+                        # low-quality detection: don't let it pollute the vote
+                        continue
+ 
+                    name, sim, gender, age, role, socialnumber = self.recognize_face(
+                        face.embedding, gender, age
+                    )
+                    x1, y1, x2, y2 = map(int, face.bbox)
+ 
+                    # VOTING: accumulate this sample instead of committing immediately.
+                    self.track_votes.setdefault(track_id, []).append(
+                        (name, sim, gender, age, role, socialnumber)
+                    )
+                    self.embedding_cache[track_id] = face.embedding
+ 
+                    # Show a tentative label while votes accumulate
+                    self.update_face_info(
+                        track_id, "Analyzing...", sim, gender, age, role, socialnumber,
+                        (x1, y1, x2, y2)
+                    )
+ 
+                    if len(self.track_votes[track_id]) < self.config.votes_required:
+                        continue
+ 
+                    # Enough samples: resolve the vote and lock the identity in.
+                    final_name, final_sim, final_gender, final_age, final_role, final_social = \
+                        self._resolve_votes(self.track_votes.pop(track_id))
+                    self.track_decided.add(track_id)
+ 
+                    self.update_face_info(
+                        track_id, final_name, final_sim, final_gender, final_age,
+                        final_role, final_social, (x1, y1, x2, y2)
+                    )
+ 
+                    if final_name == "unknown":
+                        continue
+ 
+                    height_f, width_f = face_img.shape[:2]
+                    padding = self.config.padding
+                    fx1_padded = max(x1 - padding, 0)
+                    fy1_padded = max(y1 - padding, 0)
+                    fx2_padded = min(x2 + padding, width_f)
+                    fy2_padded = min(y2 + padding, height_f)
+ 
+                    cropped_face = face_img[fy1_padded:fy2_padded,
+                                            fx1_padded:fx2_padded]
+ 
+                    if track_id not in self.processed_tracks:
+                        try:
+                            read_idx = self.capture_read_idx
+                            current_full_frame = self.capture_buffer[read_idx]
+                            insertToDb(
+                                final_name,
+                                current_full_frame.copy() if current_full_frame is not None else None,
+                                cropped_face.copy(),
+                                face_img.copy(),
+                                det_score, track_id, final_gender, final_age,
+                                final_role, final_social,
+                                path, self.config.quality, region_data,
+                                self.config.isRelay, self.config.isRegionMode,
+                                self.config.ip_relay, self.config.ip_port,
+                                self.config.relayN1, self.config.relayN2
+                            )
+                            self.processed_tracks.add(track_id)
+                        except Exception as e:
+                            logging.error(f"Error inserting to DB: {e}")
+ 
             except queue.Empty:
                 continue
         logging.info("Recognition worker stopped.")
-
+ 
+    def _resolve_votes(self, votes):
+        """
+        Resolve accumulated (name, sim, gender, age, role, socialnumber) samples
+        for a track into a single identity decision.
+ 
+        Weighted majority: each candidate name's "score" is the sum of its
+        similarity scores across samples (not just a raw count), so one
+        high-confidence match outweighs two marginal ones. The winner must
+        also account for a strict majority of samples, or we fall back to
+        "unknown" rather than committing on a split vote.
+        """
+        tally = {}
+        for name, sim, gender, age, role, socialnumber in votes:
+            entry = tally.setdefault(
+                name, {'total_sim': 0.0, 'count': 0, 'last': None})
+            entry['total_sim'] += sim
+            entry['count'] += 1
+            entry['last'] = (gender, age, role, socialnumber)
+ 
+        best_name = max(tally, key=lambda n: tally[n]['total_sim'])
+        best = tally[best_name]
+ 
+        if best_name == "unknown" or best['count'] * 2 <= len(votes):
+            # no real majority — don't commit to an identity
+            gender, age, role, socialnumber = votes[-1][2], votes[-1][3], votes[-1][4], votes[-1][5]
+            return "unknown", 0.0, gender, age, role, socialnumber
+ 
+        avg_sim = best['total_sim'] / best['count']
+        gender, age, role, socialnumber = best['last']
+        return best_name, avg_sim, gender, age, role, socialnumber
+ 
     def recognize_face(self, embedding, fgender, fage):
         """Recognize face using batch vectorized cosine similarity"""
         if self.config._embedding_matrix.shape[0] == 0:
-            return "unknown", 0.0, fgender, fage, '',''
-
+            return "unknown", 0.0, fgender, fage, '', ''
+ 
         query = embedding.astype(np.float32)
         query_norm = np.linalg.norm(query)
         if query_norm > 0:
             query = query / query_norm
-
+ 
         sims = self.config._embedding_matrix @ query
         best_idx = int(np.argmax(sims))
         best_score = float(sims[best_idx])
-
+ 
         if best_score >= self.config.simscore:
             name, age, gender, role, socialnumber = self.config._embedding_labels[best_idx]
             return name, best_score, gender, age, role, socialnumber
-
-        return "unknown", best_score, fgender, fage, '',''
-
+ 
+        return "unknown", best_score, fgender, fage, '', ''
+ 
     def update_face_info(self, track_id, name, score, gender, age, role, socialnumber, bbox=None):
         """Thread-safe update of face information"""
         with self.face_info_lock:
@@ -766,6 +852,7 @@ class CameraManager:
                 'role': role,
                 'socialnumber': socialnumber
             }
+ 
 
     def release_resources(self, role=False):
         # if fresh is not None:
@@ -950,7 +1037,7 @@ def _get_crop_face_handler():
     global _crop_face_handler
     if _crop_face_handler is None:
         _crop_face_handler = FaceAnalysis(
-            'antelopev2',
+            'buffalo_l',
             providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
             root='.'
         )

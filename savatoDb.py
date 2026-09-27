@@ -33,7 +33,7 @@ def reciveFromUi(name, imagePath, age, gender, role, socialnumber, isUrl,device)
     """
     Receive data from the UI and process it.
     """
-    face_embedder = FaceAnalysis('antelopev2',
+    face_embedder = FaceAnalysis('buffalo_l',
                                  
                        providers= ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device=='cuda' else ['CPUExecutionProvider'], root='.')
     face_embedder.prepare(ctx_id=0)
@@ -179,13 +179,29 @@ def load_embeddings_from_db():
     Load known face embeddings from a database and store them in the `known_names` dictionary.
     Each entry contains name, age, gender, and embeddings.
     """
-    url = "http://127.0.0.1:8091/api/collections/known_face/records?perPage=1000"
-
+    base_url = "http://127.0.0.1:8091/api/collections/known_face/records"
+    per_page = 1000
+    timeout = 10
+ 
     try:
-        res = requests.get(url)
-        res.raise_for_status()
-        records = res.json()["items"]
-
+        records = []
+        page = 1
+        total_pages = 1
+ 
+        # FIX: paginate instead of assuming everything fits in one page of 1000.
+        while page <= total_pages:
+            res = requests.get(
+                base_url,
+                params={"perPage": per_page, "page": page},
+                timeout=timeout
+            )
+            res.raise_for_status()
+            data = res.json()
+ 
+            records.extend(data.get("items", []))
+            total_pages = data.get("totalPages", 1)
+            page += 1
+ 
         for item in records:
             name = item["name"]
             # Note: typo in original - should be "embeddings"
@@ -193,39 +209,51 @@ def load_embeddings_from_db():
             age = item.get('age')
             gender = item.get('gender')
             role = item.get('role')
-            socialnumber=item.get('socialnumber')
-
+            socialnumber = item.get('socialnumber')
+ 
             if embedding:
+                # FIX: if the embedding is shorter than one full vector (512),
+                # the old trim logic (`len % 512`) silently collapses it to an
+                # empty list instead of erroring — this person would end up
+                # with zero embeddings, unrecognizable, with no log trace.
+                if len(embedding) < 512:
+                    logging.warning(
+                        f"Skipping malformed embedding for {name}: "
+                        f"length {len(embedding)} (< 512)"
+                    )
+                    continue
+ 
                 embedding = embedding[:len(embedding) - (len(embedding) % 512)]
                 try:
                     reshaped = safe_reshape(embedding)
-
+ 
                     # Initialize the person's entry if it doesn't exist
                     if name not in known_names:
                         known_names[name] = {
-
                             'age': age,
                             'gender': gender,
                             'role': role,
                             'socialnumber': socialnumber,
                             'embeddings': []
                         }
-
+ 
                     # Add all embeddings for this person
                     for emb in reshaped:
                         emb_array = np.array(emb, dtype=np.float32)
                         known_names[name]['embeddings'].append(emb_array)
-
+ 
                 except Exception as reshape_error:
                     logging.error(
                         f"Error reshaping embedding for {name}: {reshape_error}")
-
+ 
         total_embeddings = sum(len(person['embeddings'])
                                for person in known_names.values())
         logging.info(
-            f"Loaded {total_embeddings} embeddings from {len(known_names)} persons")
+            f"Loaded {total_embeddings} embeddings from {len(known_names)} persons "
+            f"({len(records)} records, {page - 1} page(s))"
+        )
         return known_names
-
+ 
     except Exception as e:
         logging.error(f"Failed to load embeddings: {e}")
         return {}
