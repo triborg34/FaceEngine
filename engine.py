@@ -582,7 +582,7 @@ class CameraManager:
                     classes=[0],  # Person class
                     iou=self.config.iou,
                     tracker="bytetrack.yaml",
-                    persist=False,
+                    persist=True,
                     device=self.config.device,
                     conf=self.config.hscore,
                 )

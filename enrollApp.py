@@ -4,6 +4,7 @@
 --------------------------------------
 - اتصال به دوربین RTSP
 - گرفتن عکس
+- یا انتخاب عکس از فایل
 - تشخیص افراد با YOLO
 - انتخاب فرد مورد نظر با کلیک
 - استخراج امبدینگ چهره با InsightFace
@@ -19,14 +20,16 @@
 
 import io
 import json
+import re
 import threading
 import time
+from datetime import date
 
 import cv2
 import numpy as np
 import requests
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
 
 from ultralytics import YOLO
@@ -41,6 +44,104 @@ YOLO_MODEL_PATH = "models/yolov8n.pt"
 FACE_MODEL_NAME = "buffalo_l"   # برای استفاده تجاری از antelopev2 استفاده نکنید (لایسنس)
 DET_SIZE = (640, 640)
 REQUEST_TIMEOUT = 10
+
+# ---------------------------------------------------------------------------
+# توابع تبدیل تاریخ شمسی (بدون وابستگی خارجی)
+# ---------------------------------------------------------------------------
+_PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "0123456789" * 2)
+
+
+def jalali_to_gregorian(jy, jm, jd):
+    """تبدیل تاریخ شمسی به میلادی -> (gy, gm, gd)"""
+    jy += 1595
+    days = -355668 + 365 * jy + (jy // 33) * 8 + (((jy % 33) + 3) // 4) + jd
+    if jm < 7:
+        days += (jm - 1) * 31
+    else:
+        days += (jm - 7) * 30 + 186
+
+    gy = 400 * (days // 146097)
+    days %= 146097
+    if days > 36524:
+        days -= 1
+        gy += 100 * (days // 36524)
+        days %= 36524
+        if days >= 365:
+            days += 1
+    gy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        gy += (days - 1) // 365
+        days = (days - 1) % 365
+    gd = days + 1
+
+    leap = (gy % 4 == 0 and gy % 100 != 0) or gy % 400 == 0
+    month_days = (0, 31, 29 if leap else 28, 31, 30, 31, 30,
+                  31, 31, 30, 31, 30, 31)
+    gm = 1
+    while gm < 13 and gd > month_days[gm]:
+        gd -= month_days[gm]
+        gm += 1
+    return gy, gm, gd
+
+
+def gregorian_to_jalali(gy, gm, gd):
+    """تبدیل تاریخ میلادی به شمسی -> (jy, jm, jd)"""
+    g_d_m = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+    jy = 979 if gy > 1600 else 0
+    gy -= 1600 if gy > 1600 else 621
+    gy2 = gy + 1 if gm > 2 else gy
+    days = (365 * gy + (gy2 + 3) // 4 - (gy2 + 99) // 100
+            + (gy2 + 399) // 400 - 80 + gd + g_d_m[gm - 1])
+
+    jy += 33 * (days // 12053)
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+
+    if days < 186:
+        jm = 1 + days // 31
+        jd = 1 + days % 31
+    else:
+        jm = 7 + (days - 186) // 30
+        jd = 1 + (days - 186) % 30
+    return jy, jm, jd
+
+
+def parse_jalali_date(text):
+    """خواندن متن مثل '1377/04/12' (ارقام فارسی/عربی هم پذیرفته می‌شود)
+    و برگرداندن tuple شمسی، یا None اگر نامعتبر باشد."""
+    if not text:
+        return None
+    text = text.translate(_PERSIAN_DIGITS).strip()
+    parts = [p for p in re.split(r"[/\-.]", text) if p]
+    if len(parts) != 3:
+        return None
+    try:
+        jy, jm, jd = (int(p) for p in parts)
+    except ValueError:
+        return None
+    if not (1200 <= jy <= 1600 and 1 <= jm <= 12 and 1 <= jd <= 31):
+        return None
+    # اعتبارسنجی (مثلاً ۳۰ اسفند در سال کبیسه‌الحقبودن): تبدیل رفت و برگشت
+    gy, gm, gd = jalali_to_gregorian(jy, jm, jd)
+    if gregorian_to_jalali(gy, gm, gd) != (jy, jm, jd):
+        return None
+    return jy, jm, jd
+
+
+def jalali_age(jalali_birth, today=None):
+    """سن به سال تمام‌شده برای تولد شمسی."""
+    today = today or date.today()
+    gy, gm, gd = jalali_to_gregorian(*jalali_birth)
+    birth = date(gy, gm, gd)
+    if birth > today:
+        return -1
+    return today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
+
 
 
 class EnrollApp:
@@ -109,6 +210,9 @@ class EnrollApp:
         self.capture_btn = ttk.Button(top, text="گرفتن عکس", command=self.take_picture, state=tk.DISABLED)
         self.capture_btn.pack(side=tk.LEFT, padx=4)
 
+        self.file_btn = ttk.Button(top, text="🖼 انتخاب عکس از فایل", command=self.load_picture_from_file)
+        self.file_btn.pack(side=tk.LEFT, padx=4)
+
         self.live_btn = ttk.Button(top, text="بازگشت به تصویر زنده", command=self.back_to_live, state=tk.DISABLED)
         self.live_btn.pack(side=tk.LEFT, padx=4)
 
@@ -133,9 +237,14 @@ class EnrollApp:
         self.name_entry = ttk.Entry(form, width=30)
         self.name_entry.pack(pady=2)
 
-        ttk.Label(form, text="سن:").pack(anchor="e", pady=(8, 0))
-        self.age_entry = ttk.Entry(form, width=30)
-        self.age_entry.pack(pady=2)
+        ttk.Label(form, text="تاریخ تولد (شمسی):").pack(anchor="e", pady=(8, 0))
+        self.birth_entry = ttk.Entry(form, width=30)
+        self.birth_entry.pack(pady=2)
+        self.birth_entry.bind("<KeyRelease>", self._update_age_preview)
+
+        ttk.Label(form, text="مثال: 1377/04/12", foreground="#777777").pack(anchor="e")
+        self.age_label = ttk.Label(form, text="سن: —", anchor="e")
+        self.age_label.pack(pady=(2, 0))
 
         ttk.Label(form, text="جنسیت:").pack(anchor="e", pady=(8, 0))
         self.gender_combo = ttk.Combobox(form, values=["مرد", "زن"], state="readonly", width=27)
@@ -169,6 +278,18 @@ class EnrollApp:
             self.status_label.config(text=text)
         else:
             print(text)
+
+    def _update_age_preview(self, event=None):
+        """نمایش زنده‌ی سن محاسبه‌شده از روی تاریخ تولد شمسی."""
+        birth = parse_jalali_date(self.birth_entry.get())
+        if birth is None:
+            self.age_label.config(text="سن: —")
+            return
+        age = jalali_age(birth)
+        if age < 0:
+            self.age_label.config(text="سن: — (تاریخ در آینده است)")
+        else:
+            self.age_label.config(text=f"سن: {age} سال")
 
     # -----------------------------------------------------------------
     # دوربین / RTSP
@@ -290,8 +411,12 @@ class EnrollApp:
         self.current_embedding = None
         self.selected_face_crop = None
         self.live_btn.config(state=tk.DISABLED)
-        self.send_btn.config(state=tk.DISABLED)
+        if not self.pending_embeddings:
+            self.send_btn.config(state=tk.DISABLED)
         self.face_preview_label.config(image="")
+        if not self.capture_running:
+            self.canvas.delete("all")
+            self._set_status("آماده — می‌توانید عکس دیگری از فایل انتخاب کنید")
 
     # -----------------------------------------------------------------
     # گرفتن عکس + تشخیص افراد
@@ -304,23 +429,9 @@ class EnrollApp:
             messagebox.showwarning("خطا", "هنوز تصویری از دوربین دریافت نشده")
             return
 
-        self.frozen_frame = frame
-        self.selected_box_idx = None
-        self.current_embedding = None
-        self.selected_face_crop = None
-        self.send_btn.config(state=tk.DISABLED)
-        self.face_preview_label.config(image="")
-
-        try:
-            result = self.yolo_model.predict(frame, classes=[0], verbose=False)[0]
-        except Exception as e:
-            messagebox.showerror("خطا در تشخیص", str(e))
+        self._freeze_frame(frame)
+        if not self._detect_persons(frame):
             return
-
-        self.person_boxes = []
-        for box in result.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            self.person_boxes.append((x1, y1, x2, y2))
 
         if not self.person_boxes:
             messagebox.showinfo("توجه", "هیچ فردی در تصویر شناسایی نشد")
@@ -328,6 +439,60 @@ class EnrollApp:
         self.live_btn.config(state=tk.NORMAL)
         self._draw_boxes_and_show()
         self._set_status(f"{len(self.person_boxes)} فرد شناسایی شد — روی فرد مورد نظر کلیک کنید")
+
+    def load_picture_from_file(self):
+        """انتخاب عکس از فایل به‌جای دوربین و اجرای همان فرایند تشخیص/ثبت."""
+        path = filedialog.askopenfilename(
+            title="انتخاب عکس",
+            filetypes=[
+                ("تصاویر", "*.jpg *.jpeg *.png *.bmp *.webp"),
+                ("همه فایل‌ها", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        frame = cv2.imread(path)
+        if frame is None:
+            messagebox.showerror("خطا", f"خواندن تصویر ممکن نشد:\n{path}")
+            return
+
+        self._freeze_frame(frame)
+        if not self._detect_persons(frame):
+            return
+
+        if not self.person_boxes:
+            messagebox.showinfo("توجه", "هیچ فردی در تصویر شناسایی نشد")
+
+        self.live_btn.config(state=tk.NORMAL if self.capture_running else tk.DISABLED)
+        self._draw_boxes_and_show()
+        self._set_status(
+            f"{len(self.person_boxes)} فرد شناسایی شد — روی فرد مورد نظر کلیک کنید"
+        )
+
+    def _freeze_frame(self, frame):
+        """نگه‌داشتن تصویر (دوربین یا فایل) و پاک کردن انتخاب قبلی."""
+        self.frozen_frame = frame
+        self.selected_box_idx = None
+        self.current_embedding = None
+        self.selected_face_crop = None
+        if not self.pending_embeddings:
+            self.send_btn.config(state=tk.DISABLED)
+        self.face_preview_label.config(image="")
+
+    def _detect_persons(self, frame):
+        """اجرای YOLO روی تصویر و پر کردن person_boxes."""
+        try:
+            result = self.yolo_model.predict(frame, classes=[0], verbose=False)[0]
+        except Exception as e:
+            messagebox.showerror("خطا در تشخیص", str(e))
+            return False
+
+        self.person_boxes = []
+        for box in result.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            self.person_boxes.append((x1, y1, x2, y2))
+        return True
 
     def _draw_boxes_and_show(self):
         if self.frozen_frame is None:
@@ -440,10 +605,13 @@ class EnrollApp:
         self.person_boxes = []
         self.selected_box_idx = None
         self.live_btn.config(state=tk.DISABLED)
+        if not self.capture_running:
+            self.canvas.delete("all")
 
         self._set_status(
             f"اضافه شد ({len(self.pending_embeddings)} عکس در لیست) — "
-            "برای عکس بعدی «گرفتن عکس» را بزنید یا اطلاعات را تکمیل و ارسال کنید"
+            "برای عکس بعدی «گرفتن عکس» یا «انتخاب عکس از فایل» را بزنید "
+            "یا اطلاعات را تکمیل و ارسال کنید"
         )
 
     def clear_pending(self):
@@ -481,7 +649,17 @@ class EnrollApp:
             messagebox.showwarning("خطا", "وارد کردن نام الزامی است")
             return
 
-        age = self.age_entry.get().strip()
+        birth = parse_jalali_date(self.birth_entry.get())
+        if birth is None:
+            messagebox.showwarning(
+                "خطا", "تاریخ تولد شمسی معتبر وارد کنید (مثال: 1377/04/12)"
+            )
+            return
+        age_value = jalali_age(birth)
+        if age_value < 0:
+            messagebox.showwarning("خطا", "تاریخ تولد نمی‌تواند در آینده باشد")
+            return
+        age = str(age_value)
         gender = self.gender_combo.get().strip()
         role_fa = self.role_combo.get().strip()
         role_map = {"مجاز": "approve", "غیر مجاز": "denied"}
@@ -510,7 +688,8 @@ class EnrollApp:
             self.back_to_live()
             self._reset_pending()
             self.name_entry.delete(0, tk.END)
-            self.age_entry.delete(0, tk.END)
+            self.birth_entry.delete(0, tk.END)
+            self.age_label.config(text="سن: —")
             self.role_combo.set("")
             self.social_entry.delete(0, tk.END)
             self.gender_combo.set("")
