@@ -18,12 +18,19 @@ from fastapi import FastAPI, File, Query, Request, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import requests
+import subprocess
 import uvicorn
 import multiprocessing
 # Import your improved CCtvMonitor class
 from engine import CCtvMonitor, image_crop,CameraManager,sendRegularFrames,takeFrame
 from onvifmaneger import get_rtsp_url
 from savatoDb import reciveFromUi
+
+# مسیر exe‌ای که با endpoint ‎/util/openApp باز می‌شود
+# (نسبت به خود app.py ساخته می‌شود تا مستقل از پوشه‌ی اجرای سرور باشد)
+APP_EXE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "enrollApp.exe")
+
 
 # Configure logging
 logging.basicConfig(
@@ -127,6 +134,7 @@ async def video_feed(
         sendRegularFrames(source,request),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+    cctv_monitor.min_margin=0.08
     if source == "0":
         source = int(source)
     camera_idx = int(camera_id[2:])
@@ -375,7 +383,7 @@ async def insert_known_person(data: KnownPersonFields):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/known-persons")
+@app.get("/d/known-persons")
 async def get_known_persons():
     """Get list of known persons"""
     if not cctv_monitor:
@@ -468,6 +476,20 @@ async def refreshTheDb():
         cctv_monitor._build_embedding_index()
         logging.info("Known names refreshed in CCTV monitor,")
     return 200
+
+
+@app.get("/util/openApp")
+async def openApp():
+    """باز کردن برنامه‌ی تعریف‌شده در APP_EXE"""
+    if not os.path.isfile(APP_EXE):
+        raise HTTPException(status_code=404, detail="فایل exe پیدا نشد")
+    try:
+        proc = subprocess.Popen(
+            [APP_EXE], cwd=os.path.dirname(APP_EXE))
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    logging.info("Opened %s (pid=%s)", APP_EXE, proc.pid)
+    return {"opened": APP_EXE, "pid": proc.pid}
 
 
 @app.get("/util/imageSearch")

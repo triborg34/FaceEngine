@@ -1,22 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-برنامه ثبت چهره (Face Enrollment App)
---------------------------------------
-- اتصال به دوربین RTSP
-- گرفتن عکس
-- یا انتخاب عکس از فایل
-- تشخیص افراد با YOLO
-- انتخاب فرد مورد نظر با کلیک
-- استخراج امبدینگ چهره با InsightFace
-- ارسال به PocketBase (کالکشن known_face)
 
-نصب پیش‌نیازها:
-    pip install opencv-python pillow requests numpy ultralytics insightface onnxruntime
-
-نکته: اگر برای این کالکشن قبلاً رکوردی با همین نام وجود داشته باشد،
-امبدینگ جدید به لیست امبدینگ‌های همان فرد اضافه می‌شود (append)،
-نه اینکه رکورد تکراری ساخته شود.
-"""
 
 import io
 import json
@@ -29,6 +12,7 @@ import cv2
 import numpy as np
 import requests
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
 
@@ -40,10 +24,41 @@ from insightface.app import FaceAnalysis
 # ---------------------------------------------------------------------------
 POCKETBASE_URL = "http://127.0.0.1:8091"
 COLLECTION = "known_face"
+# شناسه‌ی کالکشن در PocketBase (برای ساخت آدرس فایل‌ها استفاده می‌شود؛
+# از پنل ادمین PocketBase قابل مشاهده است. با تغییر نام/شناسه باید به‌روز شود)
+COLLECTION_ID = "pbc_745878446"
 YOLO_MODEL_PATH = "models/yolov8n.pt"
-FACE_MODEL_NAME = "buffalo_l"   # برای استفاده تجاری از antelopev2 استفاده نکنید (لایسنس)
+# برای استفاده تجاری از antelopev2 استفاده نکنید (لایسنس)
+FACE_MODEL_NAME = "buffalo_l"
 DET_SIZE = (640, 640)
 REQUEST_TIMEOUT = 10
+
+# تعداد مؤلفه‌های هر بردار امبدینگ (برای شمارش تعداد عکس‌های هر فرد)
+EMBEDDING_DIM = 512
+
+# نگاشت برچسب‌های فارسی رابط به مقادیر انگلیسی ذخیره‌شده در دیتابیس
+GENDER_MAP = {"مرد": "male", "زن": "female"}
+ROLE_MAP = {"مجاز": "approve", "غیر مجاز": "denied"}
+# نگاشت معکوس، برای نمایش مقدار دیتابیس در فرم ویرایش
+GENDER_FA = {v: k for k, v in GENDER_MAP.items()}
+ROLE_FA = {v: k for k, v in ROLE_MAP.items()}
+
+# ---------------------------------------------------------------------------
+# پالت رنگ‌ها و ظاهر برنامه
+# ---------------------------------------------------------------------------
+C_PRIMARY = "#2563eb"          # آبی اصلی
+C_PRIMARY_DARK = "#1d4ed8"     # هاور
+C_PRIMARY_SOFT = "#dbeafe"     # پس‌زمینه‌ی ملایم آبی
+C_SUCCESS = "#16a34a"          # سبز دکمه‌ی ارسال
+C_SUCCESS_DARK = "#15803d"
+C_BG = "#f1f5f9"              # پس‌زمینه‌ی اصلی
+C_SURFACE = "#ffffff"          # کارت‌ها
+C_BORDER = "#e2e8f0"           # حاشیه‌ها
+C_TEXT = "#0f172a"             # متن اصلی
+C_MUTED = "#64748b"            # متن ثانویه
+C_DARK_VIEW = "#0f172a"        # پس‌زماینه بوم تصویر
+FONT_CANDIDATES = ("Vazirmatn", "IRANSansX", "IRANSans",
+                   "B Nazanin", "Tahoma", "Segoe UI")
 
 # ---------------------------------------------------------------------------
 # توابع تبدیل تاریخ شمسی (بدون وابستگی خارجی)
@@ -143,12 +158,28 @@ def jalali_age(jalali_birth, today=None):
     return today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
 
 
+def fa(value):
+    """تبدیل ارقام لاتین به فارسی برای نمایش در رابط."""
+    return str(value).translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
+
 
 class EnrollApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("ثبت چهره")
-        self.root.geometry("1100x750")
+        self.root.title("ثبت چهره — Face Enrollment")
+        self.root.configure(bg=C_BG)
+
+        # فونت فارسیِ موجود در سیستم
+        self.font = self._pick_font()
+
+        # وسط‌چین کردن پنجره
+        win_w, win_h = 1180, 860
+        self.root.geometry(
+            f"{win_w}x{win_h}"
+            f"+{max((root.winfo_screenwidth() - win_w) // 2, 0)}"
+            f"+{max((root.winfo_screenheight() - win_h) // 2, 0)}"
+        )
+        self.root.minsize(1040, 720)
 
         # --- وضعیت داخلی ---
         self.cap = None
@@ -160,14 +191,21 @@ class EnrollApp:
         self.frozen_frame = None        # فریمی که گرفته شده (take picture)
         self.person_boxes = []          # [(x1,y1,x2,y2), ...]
         self.selected_box_idx = None
-        self.current_embedding = None   # امبدینگ چهره‌ی تازه انتخاب‌شده (قبل از افزودن به لیست)
+        # امبدینگ چهره‌ی تازه انتخاب‌شده (قبل از افزودن به لیست)
+        self.current_embedding = None
         self.selected_face_crop = None  # تصویر چهره‌ی تازه انتخاب‌شده
 
         # لیست موقتِ چند عکس/امبدینگ برای همین شخص، قبل از ارسال نهایی
         self.pending_embeddings = []    # [np.array(512,), ...]
-        self.pending_face_crop = None   # آخرین چهره گرفته‌شده، برای آپلود به‌عنوان تصویر رکورد
+        self.pending_crops = []         # تصویر چهره‌ی هر آیتم (برای پیش‌نمایش)
+        # آخرین چهره گرفته‌شده، برای آپلود به‌عنوان تصویر رکورد
+        self.pending_face_crop = None
+        self._thumb_imgs = []           # نگه‌داری PhotoImage ها (جلوگیری از GC)
 
         self.cameras_map = {}           # name -> رکورد دوربین از کالکشن cameras
+        self.people_map = {}            # record_id -> رکورد شخص از کالکشن known_face
+        self._people_loaded = False     # آیا فهرست افراد یک‌بار بارگذاری شده است
+        self._people_photo = None       # نگه‌داری PhotoImage تصویر رکورد
 
         # --- بارگذاری مدل‌ها (یک‌بار در استارتاپ) ---
         self._set_status("در حال بارگذاری مدل‌ها...")
@@ -193,85 +231,441 @@ class EnrollApp:
     # -----------------------------------------------------------------
     # رابط کاربری
     # -----------------------------------------------------------------
+    def _pick_font(self):
+        """انتخاب فونت فارسیِ نصب‌شده روی سیستم."""
+        try:
+            families = set(tkfont.families(self.root))
+        except tk.TclError:
+            families = set()
+        for name in FONT_CANDIDATES:
+            if name in families:
+                return name
+        return "TkDefaultFont"
+
+    def _setup_styles(self):
+        """ظاهر مدرن برای ویجت‌های ttk."""
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        f = self.font
+        style.configure(".", font=(f, 10), background=C_BG, foreground=C_TEXT)
+
+        # قاب‌ها
+        style.configure("TFrame", background=C_BG)
+        style.configure("Card.TFrame", background=C_SURFACE)
+
+        # متن‌ها
+        style.configure("TLabel", background=C_BG, foreground=C_TEXT)
+        style.configure("Card.TLabel", background=C_SURFACE, foreground=C_TEXT)
+        style.configure("Card.Muted.TLabel",
+                        background=C_SURFACE, foreground=C_MUTED)
+        style.configure(
+            "Age.TLabel", background=C_PRIMARY_SOFT, foreground=C_PRIMARY,
+            font=(f, 10, "bold"), padding=(8, 5), anchor="center",
+        )
+        style.configure(
+            "Counter.TLabel", background=C_SURFACE, foreground=C_PRIMARY,
+            font=(f, 10, "bold"), anchor="w",
+        )
+
+        # دکمه‌ی معمولی
+        style.configure(
+            "TButton", font=(f, 10), padding=(14, 7), relief="flat",
+            background="#f8fafc", foreground=C_TEXT,
+            bordercolor="#cbd5e1", lightcolor="#f8fafc", darkcolor="#f8fafc",
+        )
+        style.map(
+            "TButton",
+            background=[("active", C_BG), ("pressed", "#e2e8f0"),
+                        ("disabled", C_BG)],
+            foreground=[("disabled", "#a5b4c8")],
+        )
+
+        # دکمه‌ی اصلی (آبی)
+        style.configure(
+            "Primary.TButton", font=(f, 10, "bold"), padding=(14, 6), relief="flat",
+            background=C_PRIMARY, foreground="white",
+            bordercolor=C_PRIMARY, lightcolor=C_PRIMARY, darkcolor=C_PRIMARY,
+        )
+        style.map(
+            "Primary.TButton",
+            background=[("active", C_PRIMARY_DARK), ("pressed",
+                                                     "#1e40af"), ("disabled", "#bfdbfe")],
+            foreground=[("disabled", "#eff6ff")],
+        )
+
+        # دکمه‌ی ارسال (سبز)
+        style.configure(
+            "Success.TButton", font=(f, 11, "bold"), padding=(14, 7), relief="flat",
+            background=C_SUCCESS, foreground="white",
+            bordercolor=C_SUCCESS, lightcolor=C_SUCCESS, darkcolor=C_SUCCESS,
+        )
+        style.map(
+            "Success.TButton",
+            background=[("active", C_SUCCESS_DARK), ("pressed",
+                                                     "#166534"), ("disabled", "#bbf7d0")],
+            foreground=[("disabled", "#f0fdf4")],
+        )
+
+        # دکمه‌ی کم‌رنگ
+        style.configure(
+            "Ghost.TButton", font=(f, 9), padding=(10, 5), relief="flat",
+            background="#f8fafc", foreground=C_MUTED,
+            bordercolor="#cbd5e1", lightcolor="#f8fafc", darkcolor="#f8fafc",
+        )
+        style.map(
+            "Ghost.TButton",
+            background=[("active", C_BG), ("pressed", "#e2e8f0"),
+                        ("disabled", C_BG)],
+            foreground=[("disabled", "#a5b4c8")],
+        )
+
+        # دکمه‌ی روی هدر آبی
+        style.configure(
+            "OnHeader.TButton", font=(f, 10), padding=(14, 7), relief="flat",
+            background=C_PRIMARY_DARK, foreground="#dbeafe",
+            bordercolor="#60a5fa", lightcolor=C_PRIMARY_DARK, darkcolor=C_PRIMARY_DARK,
+        )
+        style.map(
+            "OnHeader.TButton",
+            background=[("active", "#1e40af"), ("pressed", "#1e3a8a")],
+            foreground=[("active", "white")],
+        )
+
+        # دکمه‌ی حذف (قرمز)
+        style.configure(
+            "Danger.TButton", font=(f, 10, "bold"), padding=(14, 6), relief="flat",
+            background="#fee2e2", foreground="#dc2626",
+            bordercolor="#fecaca", lightcolor="#fee2e2", darkcolor="#fee2e2",
+        )
+        style.map(
+            "Danger.TButton",
+            background=[("active", "#fecaca"), ("pressed", "#fca5a5"),
+                        ("disabled", C_SURFACE)],
+            foreground=[("disabled", "#fca5a5")],
+        )
+
+        # فیلدهای ورودی
+        style.configure(
+            "TEntry", fieldbackground="white", foreground=C_TEXT, insertcolor=C_TEXT,
+            bordercolor=C_BORDER, lightcolor=C_BORDER, darkcolor=C_BORDER,
+            padding=6, relief="flat",
+        )
+        style.map(
+            "TEntry",
+            bordercolor=[("focus", C_PRIMARY)],
+            lightcolor=[("focus", C_PRIMARY)],
+            darkcolor=[("focus", C_PRIMARY)],
+        )
+
+        # لیست‌کشویی
+        style.configure(
+            "TCombobox", fieldbackground="white", background="white",
+            foreground=C_TEXT, bordercolor=C_BORDER, arrowcolor=C_MUTED,
+            padding=6, relief="flat",
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", "white")],
+            foreground=[("readonly", C_TEXT)],
+            bordercolor=[("focus", C_PRIMARY)],
+            lightcolor=[("focus", C_PRIMARY)],
+            darkcolor=[("focus", C_PRIMARY)],
+            arrowcolor=[("active", C_PRIMARY)],
+        )
+
+        style.configure("TSeparator", background=C_BORDER)
+
+        # تب‌ها
+        style.configure(
+            "TNotebook", background=C_BG, borderwidth=0, tabmargins=(0, 0, 0, 0),
+        )
+        style.configure(
+            "TNotebook.Tab", font=(f, 10), padding=(22, 8),
+            background="#e2e8f0", foreground=C_MUTED,
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", C_SURFACE)],
+            foreground=[("selected", C_PRIMARY)],
+        )
+
+        # جدول فهرست افراد
+        style.configure(
+            "People.Treeview", font=(f, 10), background=C_SURFACE,
+            fieldbackground=C_SURFACE, foreground=C_TEXT,
+            rowheight=28, bordercolor=C_BORDER, relief="flat",
+        )
+        style.configure(
+            "People.Treeview.Heading", font=(f, 9, "bold"),
+            background=C_BG, foreground=C_MUTED, relief="flat", padding=(6, 7),
+        )
+        style.map(
+            "People.Treeview",
+            background=[("selected", C_PRIMARY_SOFT)],
+            foreground=[("selected", C_PRIMARY)],
+        )
+        style.map(
+            "People.Treeview.Heading",
+            background=[("active", "#e2e8f0")],
+        )
+
     def _build_ui(self):
-        top = ttk.Frame(self.root, padding=8)
-        top.pack(side=tk.TOP, fill=tk.X)
+        self._setup_styles()
 
-        ttk.Label(top, text="دوربین:").pack(side=tk.LEFT, padx=4)
-        self.camera_combo = ttk.Combobox(top, width=35, state="readonly")
-        self.camera_combo.pack(side=tk.LEFT, padx=4)
+        # ---------------- هدر ----------------
+        header = tk.Frame(self.root, bg=C_PRIMARY)
+        header.pack(side=tk.TOP, fill=tk.X)
+        tk.Label(
+            header, text="ثبت چهره", bg=C_PRIMARY, fg="white",
+            font=(self.font, 16, "bold"),
+        ).pack(side=tk.RIGHT, padx=(0, 18), pady=12)
+        tk.Label(
+            header, text="Face Enrollment", bg=C_PRIMARY, fg="#bfd7ff",
+            font=(self.font, 10),
+        ).pack(side=tk.RIGHT, pady=12)
+        self.refresh_cameras_btn = ttk.Button(
+            header, text="بروزرسانی دوربین‌ها", command=self.load_cameras,
+            style="OnHeader.TButton",
+        )
+        self.refresh_cameras_btn.pack(side=tk.LEFT, padx=16, pady=10)
 
-        self.refresh_cameras_btn = ttk.Button(top, text="🔄 بارگذاری دوربین‌ها", command=self.load_cameras)
-        self.refresh_cameras_btn.pack(side=tk.LEFT, padx=4)
+        # ---------------- تب‌ها ----------------
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
-        self.connect_btn = ttk.Button(top, text="اتصال به دوربین", command=self.toggle_camera)
-        self.connect_btn.pack(side=tk.LEFT, padx=4)
+        enroll_tab = tk.Frame(self.notebook, bg=C_BG)
+        self.notebook.add(enroll_tab, text="ثبت چهره")
+        self.manage_tab = tk.Frame(self.notebook, bg=C_BG)
+        self.notebook.add(self.manage_tab, text="مدیریت افراد")
 
-        self.capture_btn = ttk.Button(top, text="گرفتن عکس", command=self.take_picture, state=tk.DISABLED)
-        self.capture_btn.pack(side=tk.LEFT, padx=4)
+        # ---------------- نوار ابزار ----------------
+        toolbar = tk.Frame(enroll_tab, bg=C_SURFACE)
+        toolbar.pack(side=tk.TOP, fill=tk.X)
+        ttk.Separator(enroll_tab, orient="horizontal").pack(
+            side=tk.TOP, fill=tk.X)
 
-        self.file_btn = ttk.Button(top, text="🖼 انتخاب عکس از فایل", command=self.load_picture_from_file)
-        self.file_btn.pack(side=tk.LEFT, padx=4)
+        ttk.Label(toolbar, text="دوربین:", style="Card.TLabel").pack(
+            side=tk.LEFT, padx=(16, 6), pady=10
+        )
+        self.camera_combo = ttk.Combobox(toolbar, width=34, state="readonly")
+        self.camera_combo.pack(side=tk.LEFT, pady=10)
 
-        self.live_btn = ttk.Button(top, text="بازگشت به تصویر زنده", command=self.back_to_live, state=tk.DISABLED)
-        self.live_btn.pack(side=tk.LEFT, padx=4)
+        self.connect_btn = ttk.Button(
+            toolbar, text="اتصال به دوربین", command=self.toggle_camera,
+            style="Primary.TButton",
+        )
+        self.connect_btn.pack(side=tk.LEFT, padx=(16, 6), pady=10)
 
-        # --- ناحیه اصلی: تصویر + فرم ---
-        main = ttk.Frame(self.root, padding=8)
-        main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.capture_btn = ttk.Button(
+            toolbar, text="گرفتن عکس", command=self.take_picture, state=tk.DISABLED
+        )
+        self.capture_btn.pack(side=tk.LEFT, padx=6, pady=10)
 
-        # بوم نمایش تصویر (سمت چپ)
-        self.canvas = tk.Canvas(main, width=800, height=600, bg="black")
-        self.canvas.pack(side=tk.LEFT, padx=4, pady=4)
+        self.file_btn = ttk.Button(
+            toolbar, text="عکس از فایل", command=self.load_picture_from_file
+        )
+        self.file_btn.pack(side=tk.LEFT, padx=6, pady=10)
+
+        self.live_btn = ttk.Button(
+            toolbar, text="بازگشت به تصویر زنده", command=self.back_to_live,
+            state=tk.DISABLED,
+        )
+        self.live_btn.pack(side=tk.LEFT, padx=(6, 16), pady=10)
+
+        # ---------------- ناحیه اصلی ----------------
+        body = tk.Frame(enroll_tab, bg=C_BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
+
+        # ستون چپ: کارت تصویر + نوار پیش‌نمایش چهره‌های اضافه‌شده
+        left_col = tk.Frame(body, bg=C_BG)
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
+
+        canvas_card = tk.Frame(
+            left_col, bg=C_SURFACE, highlightbackground=C_BORDER, highlightthickness=1
+        )
+        canvas_card.pack(fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(
+            canvas_card, bg=C_DARK_VIEW, highlightthickness=0, bd=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
         self.canvas.bind("<Button-1>", self._on_canvas_click)
 
-        # فرم اطلاعات (سمت راست)
-        form = ttk.Frame(main, padding=8)
-        form.pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        # نوار پیش‌نمایش عکس‌های جمع‌شده (فقط وقتی چیزی اضافه شده باشد)
+        self.thumbs_bar = tk.Frame(
+            left_col, bg=C_SURFACE, highlightbackground=C_BORDER, highlightthickness=1
+        )
+        thumbs_head = tk.Frame(self.thumbs_bar, bg=C_SURFACE)
+        thumbs_head.pack(fill=tk.X, padx=12, pady=(10, 0))
+        tk.Label(
+            thumbs_head, text="پیش‌نمایش چهره‌های اضافه‌شده قبل از ارسال",
+            bg=C_SURFACE, fg=C_MUTED, font=(self.font, 9),
+        ).pack(side=tk.RIGHT)
+        self.thumbs_count = tk.Label(
+            thumbs_head, bg=C_PRIMARY_SOFT, fg=C_PRIMARY,
+            font=(self.font, 9, "bold"), padx=8,
+        )
+        self.thumbs_count.pack(side=tk.LEFT)
 
-        ttk.Label(form, text="چهره انتخاب‌شده:").pack(anchor="e")
-        self.face_preview_label = ttk.Label(form)
-        self.face_preview_label.pack(pady=4)
+        self.thumbs_canvas = tk.Canvas(
+            self.thumbs_bar, bg=C_SURFACE, highlightthickness=0, height=104
+        )
+        self.thumbs_canvas.pack(fill=tk.X, padx=12, pady=(6, 12))
+        self.thumbs_inner = tk.Frame(self.thumbs_canvas, bg=C_SURFACE)
+        self._thumbs_win = self.thumbs_canvas.create_window(
+            (self.thumbs_canvas.winfo_width(), 0),
+            window=self.thumbs_inner, anchor="ne",
+        )
+        self.thumbs_inner.bind("<Configure>", self._on_thumbs_configure)
+        self.thumbs_canvas.bind("<Configure>", self._on_thumbs_configure)
+        self.thumbs_canvas.bind("<MouseWheel>", self._on_thumbs_wheel)
 
-        ttk.Label(form, text="نام:").pack(anchor="e", pady=(12, 0))
-        self.name_entry = ttk.Entry(form, width=30)
-        self.name_entry.pack(pady=2)
+        # فرم اطلاعات (سمت راست، چون رابط فارسی است)
+        form = tk.Frame(
+            body, bg=C_SURFACE, width=320,
+            highlightbackground=C_BORDER, highlightthickness=1,
+        )
+        form.pack(side=tk.RIGHT, fill=tk.Y)
+        form.pack_propagate(False)
 
-        ttk.Label(form, text="تاریخ تولد (شمسی):").pack(anchor="e", pady=(8, 0))
-        self.birth_entry = ttk.Entry(form, width=30)
-        self.birth_entry.pack(pady=2)
+        tk.Label(
+            form, text="اطلاعات فرد", bg=C_SURFACE, fg=C_TEXT,
+            font=(self.font, 12, "bold"),
+        ).pack(anchor="e", padx=16, pady=(12, 0))
+        ttk.Separator(form, orient="horizontal").pack(
+            fill=tk.X, padx=16, pady=(6, 8))
+
+        preview_box = tk.Frame(
+            form, width=104, height=104, bg=C_BG,
+            highlightbackground=C_BORDER, highlightthickness=1,
+        )
+        preview_box.pack(anchor="e", padx=16, pady=(2, 4))
+        preview_box.pack_propagate(False)
+        self.face_preview_label = tk.Label(
+            preview_box, bg=C_BG, text="بدون چهره", fg="#94a3b8", font=(self.font, 9)
+        )
+        self.face_preview_label.pack(expand=True, fill=tk.BOTH)
+
+        fields = tk.Frame(form, bg=C_SURFACE)
+        fields.pack(fill=tk.X, padx=16, pady=(6, 0))
+
+        # همه‌ی فیلدهای فرم به StringVar وصل می‌شوند تا ریست کردن فرم قابل
+        # اتکا باشد؛ چون set("") روی Combobox با state="readonly" نمایش را
+        # همیشه پاک نمی‌کند ولی مقدارِ متغیر همیشه پاک می‌شود.
+        self.name_var = tk.StringVar()
+        self.birth_var = tk.StringVar()
+        self.gender_var = tk.StringVar()
+        self.role_var = tk.StringVar()
+        self.social_var = tk.StringVar()
+        self.userwhom_var = tk.StringVar()
+
+        def label_for(parent, text):
+            tk.Label(
+                parent, text=text, bg=C_SURFACE, fg=C_MUTED, font=(
+                    self.font, 9)
+            ).pack(anchor="e", pady=(7, 2))
+
+        label_for(fields, "نام")
+        self.name_entry = ttk.Entry(fields, textvariable=self.name_var)
+        self.name_entry.pack(fill=tk.X)
+
+        # عنوان تولد + نشان سن، هر دو در یک ردیف (برای جلوگیری از بلند شدن فرم)
+        birth_row = tk.Frame(fields, bg=C_SURFACE)
+        birth_row.pack(fill=tk.X, pady=(7, 2))
+        tk.Label(
+            birth_row, text="تاریخ تولد (شمسی)", bg=C_SURFACE, fg=C_MUTED,
+            font=(self.font, 9),
+        ).pack(side=tk.RIGHT)
+        self.age_label = ttk.Label(birth_row, text="سن: —", style="Age.TLabel")
+        self.age_label.pack(side=tk.LEFT)
+
+        self.birth_entry = ttk.Entry(fields, textvariable=self.birth_var)
+        self.birth_entry.pack(fill=tk.X)
         self.birth_entry.bind("<KeyRelease>", self._update_age_preview)
+        tk.Label(
+            fields, text="مثال: 1377/04/12", bg=C_SURFACE, fg="#94a3b8",
+            font=(self.font, 8),
+        ).pack(anchor="e")
 
-        ttk.Label(form, text="مثال: 1377/04/12", foreground="#777777").pack(anchor="e")
-        self.age_label = ttk.Label(form, text="سن: —", anchor="e")
-        self.age_label.pack(pady=(2, 0))
+        duo = tk.Frame(fields, bg=C_SURFACE)
+        duo.pack(fill=tk.X)
 
-        ttk.Label(form, text="جنسیت:").pack(anchor="e", pady=(8, 0))
-        self.gender_combo = ttk.Combobox(form, values=["مرد", "زن"], state="readonly", width=27)
-        self.gender_combo.pack(pady=2)
+        col_gender = tk.Frame(duo, bg=C_SURFACE)
+        col_gender.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        label_for(col_gender, "جنسیت")
+        self.gender_combo = ttk.Combobox(
+            col_gender, textvariable=self.gender_var,
+            values=["مرد", "زن"], state="readonly"
+        )
+        self.gender_combo.pack(fill=tk.X)
 
-        ttk.Label(form, text="نقش:").pack(anchor="e", pady=(8, 0))
-        self.role_combo = ttk.Combobox(form, values=["مجاز", "غیر مجاز"], state="readonly", width=27)
-        self.role_combo.pack(pady=2)
+        col_role = tk.Frame(duo, bg=C_SURFACE)
+        col_role.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        label_for(col_role, "نقش")
+        self.role_combo = ttk.Combobox(
+            col_role, textvariable=self.role_var,
+            values=["مجاز", "غیر مجاز"], state="readonly"
+        )
+        self.role_combo.pack(fill=tk.X)
 
-        ttk.Label(form, text="کد ملی:").pack(anchor="e", pady=(8, 0))
-        self.social_entry = ttk.Entry(form, width=30)
-        self.social_entry.pack(pady=2)
+        label_for(fields, "کد ملی")
+        self.social_entry = ttk.Entry(fields, textvariable=self.social_var)
+        self.social_entry.pack(fill=tk.X, pady=(0, 4))
 
-        self.add_btn = ttk.Button(form, text="➕ افزودن این چهره به لیست", command=self.add_to_pending, state=tk.DISABLED)
-        self.add_btn.pack(pady=(20, 4))
+        label_for(fields, "سمت")
+        self.userwhom_combo = ttk.Combobox(
+            fields, textvariable=self.userwhom_var,
+            values=["ارباب رجوع", "همکار"], state="readonly"
+        )
+        self.userwhom_combo.pack(fill=tk.X, pady=(0, 4))
 
-        self.pending_label = ttk.Label(form, text="عکس‌های اضافه‌شده: ۰", anchor="e")
-        self.pending_label.pack(pady=2)
 
-        self.clear_pending_btn = ttk.Button(form, text="پاک کردن لیست عکس‌ها", command=self.clear_pending, state=tk.DISABLED)
-        self.clear_pending_btn.pack(pady=2)
+        
 
-        self.send_btn = ttk.Button(form, text="ارسال نهایی به پایگاه داده", command=self.send_to_db, state=tk.DISABLED)
-        self.send_btn.pack(pady=(16, 4))
+        # ---------------- دکمه‌ها (پایین فرم) ----------------
+        actions = tk.Frame(form, bg=C_SURFACE)
+        actions.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=12)
 
-        self.status_label = ttk.Label(self.root, text="", anchor="w", relief=tk.SUNKEN)
-        self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
+        self.send_btn = ttk.Button(
+            actions, text="ارسال نهایی به پایگاه داده", command=self.send_to_db,
+            state=tk.DISABLED, style="Success.TButton",
+        )
+        self.send_btn.pack(fill=tk.X, pady=(0, 6))
+
+        self.add_btn = ttk.Button(
+            actions, text="افزودن این چهره به لیست", command=self.add_to_pending,
+            state=tk.DISABLED, style="Primary.TButton",
+        )
+        self.add_btn.pack(fill=tk.X, pady=(0, 6))
+
+        counter_row = tk.Frame(actions, bg=C_SURFACE)
+        counter_row.pack(fill=tk.X)
+        self.pending_label = ttk.Label(
+            counter_row, text="عکس‌های اضافه‌شده: ۰", style="Counter.TLabel"
+        )
+        self.pending_label.pack(side=tk.LEFT)
+        self.clear_pending_btn = ttk.Button(
+            counter_row, text="پاک کردن", command=self.clear_pending,
+            state=tk.DISABLED, style="Ghost.TButton",
+        )
+        self.clear_pending_btn.pack(side=tk.RIGHT)
+
+        # ---------------- نوار وضعیت ----------------
+        status_bar = tk.Frame(self.root, bg=C_SURFACE)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Separator(self.root, orient="horizontal").pack(
+            side=tk.BOTTOM, fill=tk.X)
+        self.status_label = tk.Label(
+            status_bar, text="", anchor="e", bg=C_SURFACE, fg=C_MUTED,
+            font=(self.font, 9), padx=16, pady=7,
+        )
+        self.status_label.pack(fill=tk.X)
+
+        # ---------------- تب مدیریت افراد ----------------
+        self._build_manage_tab()
 
     def _set_status(self, text):
         if hasattr(self, "status_label"):
@@ -281,7 +675,7 @@ class EnrollApp:
 
     def _update_age_preview(self, event=None):
         """نمایش زنده‌ی سن محاسبه‌شده از روی تاریخ تولد شمسی."""
-        birth = parse_jalali_date(self.birth_entry.get())
+        birth = parse_jalali_date(self.birth_var.get())
         if birth is None:
             self.age_label.config(text="سن: —")
             return
@@ -298,7 +692,8 @@ class EnrollApp:
         """بارگذاری لیست دوربین‌ها از کالکشن cameras در PocketBase"""
         url = f"{POCKETBASE_URL}/api/collections/cameras/records"
         try:
-            res = requests.get(url, params={"perPage": 200}, timeout=REQUEST_TIMEOUT)
+            res = requests.get(
+                url, params={"perPage": 200}, timeout=REQUEST_TIMEOUT)
             res.raise_for_status()
             records = res.json().get("items", [])
         except Exception as e:
@@ -354,7 +749,8 @@ class EnrollApp:
             cam = self.cameras_map[cam_name]
             url = self._build_rtsp_url(cam)
             if not url:
-                messagebox.showwarning("خطا", "برای این دوربین آدرس معتبری ساخته نشد (فیلد ip یا rtspUrl خالی است)")
+                messagebox.showwarning(
+                    "خطا", "برای این دوربین آدرس معتبری ساخته نشد (فیلد ip یا rtspUrl خالی است)")
                 return
 
             self._start_camera(url)
@@ -369,7 +765,8 @@ class EnrollApp:
             return
 
         self.capture_running = True
-        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.capture_thread = threading.Thread(
+            target=self._capture_loop, daemon=True)
         self.capture_thread.start()
         self._update_preview()
         self._set_status("دوربین متصل شد")
@@ -413,7 +810,7 @@ class EnrollApp:
         self.live_btn.config(state=tk.DISABLED)
         if not self.pending_embeddings:
             self.send_btn.config(state=tk.DISABLED)
-        self.face_preview_label.config(image="")
+        self._clear_face_preview()
         if not self.capture_running:
             self.canvas.delete("all")
             self._set_status("آماده — می‌توانید عکس دیگری از فایل انتخاب کنید")
@@ -438,7 +835,8 @@ class EnrollApp:
 
         self.live_btn.config(state=tk.NORMAL)
         self._draw_boxes_and_show()
-        self._set_status(f"{len(self.person_boxes)} فرد شناسایی شد — روی فرد مورد نظر کلیک کنید")
+        self._set_status(
+            f"{len(self.person_boxes)} فرد شناسایی شد — روی فرد مورد نظر کلیک کنید")
 
     def load_picture_from_file(self):
         """انتخاب عکس از فایل به‌جای دوربین و اجرای همان فرایند تشخیص/ثبت."""
@@ -464,7 +862,8 @@ class EnrollApp:
         if not self.person_boxes:
             messagebox.showinfo("توجه", "هیچ فردی در تصویر شناسایی نشد")
 
-        self.live_btn.config(state=tk.NORMAL if self.capture_running else tk.DISABLED)
+        self.live_btn.config(
+            state=tk.NORMAL if self.capture_running else tk.DISABLED)
         self._draw_boxes_and_show()
         self._set_status(
             f"{len(self.person_boxes)} فرد شناسایی شد — روی فرد مورد نظر کلیک کنید"
@@ -478,12 +877,13 @@ class EnrollApp:
         self.selected_face_crop = None
         if not self.pending_embeddings:
             self.send_btn.config(state=tk.DISABLED)
-        self.face_preview_label.config(image="")
+        self._clear_face_preview()
 
     def _detect_persons(self, frame):
         """اجرای YOLO روی تصویر و پر کردن person_boxes."""
         try:
-            result = self.yolo_model.predict(frame, classes=[0], verbose=False)[0]
+            result = self.yolo_model.predict(
+                frame, classes=[0], verbose=False)[0]
         except Exception as e:
             messagebox.showerror("خطا در تشخیص", str(e))
             return False
@@ -509,19 +909,25 @@ class EnrollApp:
     def _show_on_canvas(self, bgr_frame):
         rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
-        canvas_w, canvas_h = 800, 600
+        canvas_w = self.canvas.winfo_width()
+        canvas_h = self.canvas.winfo_height()
+        if canvas_w < 10 or canvas_h < 10:
+            canvas_w, canvas_h = 800, 600
         scale = min(canvas_w / w, canvas_h / h)
         new_w, new_h = int(w * scale), int(h * scale)
         resized = cv2.resize(rgb, (new_w, new_h))
 
         img = Image.fromarray(resized)
-        self._tk_img = ImageTk.PhotoImage(image=img)  # جلوگیری از garbage collection
+        # جلوگیری از garbage collection
+        self._tk_img = ImageTk.PhotoImage(image=img)
         self.canvas.delete("all")
-        self.canvas.create_image(canvas_w // 2, canvas_h // 2, image=self._tk_img)
+        self.canvas.create_image(
+            canvas_w // 2, canvas_h // 2, image=self._tk_img)
 
         # برای تبدیل مختصات کلیک بعداً لازم داریم
         self._display_scale = scale
-        self._display_offset = ((canvas_w - new_w) // 2, (canvas_h - new_h) // 2)
+        self._display_offset = ((canvas_w - new_w) // 2,
+                                (canvas_h - new_h) // 2)
 
     # -----------------------------------------------------------------
     # انتخاب فرد با کلیک + استخراج چهره
@@ -562,7 +968,7 @@ class EnrollApp:
             self.current_embedding = None
             self.selected_face_crop = None
             self.add_btn.config(state=tk.DISABLED)
-            self.face_preview_label.config(image="")
+            self._clear_face_preview()
             return
 
         face = faces[0]
@@ -579,7 +985,8 @@ class EnrollApp:
         self.selected_face_crop = face_crop.copy()
         self._show_face_preview(face_crop)
         self.add_btn.config(state=tk.NORMAL)
-        self._set_status("چهره استخراج شد — می‌توانید آن را به لیست اضافه کنید")
+        self._set_status(
+            "چهره استخراج شد — می‌توانید آن را به لیست اضافه کنید")
 
     # -----------------------------------------------------------------
     # مدیریت لیست موقتِ چند عکس برای یک نفر
@@ -589,18 +996,16 @@ class EnrollApp:
             return
 
         self.pending_embeddings.append(self.current_embedding)
-        self.pending_face_crop = self.selected_face_crop  # آخرین چهره برای آپلود نگه داشته می‌شود
-
-        self.pending_label.config(text=f"عکس‌های اضافه‌شده: {len(self.pending_embeddings)}")
-        self.clear_pending_btn.config(state=tk.NORMAL)
-        self.send_btn.config(state=tk.NORMAL)
+        self.pending_crops.append(self.selected_face_crop)
+        # آخرین چهره برای آپلود نگه داشته می‌شود
+        self.pending_face_crop = self.selected_face_crop
 
         # آماده‌سازی برای گرفتن عکس بعدی از همان شخص —
-        # فرم (نام/سن/...) دست‌نخورده می‌ماند چون شخص همان است
+        # فرم (نام/تولد/...) دست‌نخورده می‌ماند چون شخص همان است
         self.current_embedding = None
         self.selected_face_crop = None
         self.add_btn.config(state=tk.DISABLED)
-        self.face_preview_label.config(image="")
+        self._clear_face_preview()
         self.frozen_frame = None
         self.person_boxes = []
         self.selected_box_idx = None
@@ -608,11 +1013,32 @@ class EnrollApp:
         if not self.capture_running:
             self.canvas.delete("all")
 
+        self._render_pending_thumbs()
+
         self._set_status(
-            f"اضافه شد ({len(self.pending_embeddings)} عکس در لیست) — "
-            "برای عکس بعدی «گرفتن عکس» یا «انتخاب عکس از فایل» را بزنید "
+            f"اضافه شد ({fa(len(self.pending_embeddings))} عکس در لیست) — "
+            "برای عکس بعدی «گرفتن عکس» یا «عکس از فایل» را بزنید "
             "یا اطلاعات را تکمیل و ارسال کنید"
         )
+
+    def _remove_pending(self, idx):
+        """حذف یک عکس از لیست موقت (دکمه‌ی × روی بندانگشتی)."""
+        if not 0 <= idx < len(self.pending_embeddings):
+            return
+        removed = idx + 1
+        self.pending_embeddings.pop(idx)
+        self.pending_crops.pop(idx)
+        self.pending_face_crop = (
+            self.pending_crops[-1] if self.pending_crops else None
+        )
+        self._render_pending_thumbs()
+        if self.pending_embeddings:
+            self._set_status(
+                f"عکس شماره {fa(removed)} حذف شد "
+                f"({fa(len(self.pending_embeddings))} عکس باقی مانده)"
+            )
+        else:
+            self._set_status("همه عکس‌های اضافه‌شده حذف شد")
 
     def clear_pending(self):
         """پاک کردن لیست از دکمه — با تأییدیه."""
@@ -625,31 +1051,488 @@ class EnrollApp:
     def _reset_pending(self):
         """پاک کردن داخلی لیست، بدون تأییدیه (بعد از ارسال موفق فراخوانی می‌شود)."""
         self.pending_embeddings = []
+        self.pending_crops = []
         self.pending_face_crop = None
-        self.pending_label.config(text="عکس‌های اضافه‌شده: ۰")
-        self.clear_pending_btn.config(state=tk.DISABLED)
-        self.send_btn.config(state=tk.DISABLED)
+        self._render_pending_thumbs()
+
+    # -----------------------------------------------------------------
+    # نوار پیش‌نمایش بندانگشتیِ عکس‌های جمع‌شده
+    # -----------------------------------------------------------------
+    def _thumb_photo(self, bgr_crop, size=72):
+        if bgr_crop is None or getattr(bgr_crop, "size", 0) == 0:
+            img = Image.new("RGB", (size, size), (226, 232, 240))
+        else:
+            rgb = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(rgb).resize((size, size))
+        return ImageTk.PhotoImage(image=img)
+
+    def _render_pending_thumbs(self):
+        """بازسازی نوار پیش‌نمایش + به‌روزرسانی شمارنده و دکمه‌ها."""
+        count = len(self.pending_embeddings)
+        self.pending_label.config(text=f"عکس‌های اضافه‌شده: {fa(count)}")
+
+        for child in self.thumbs_inner.winfo_children():
+            child.destroy()
+        self._thumb_imgs = []
+
+        if count == 0:
+            self.thumbs_bar.pack_forget()
+            self.clear_pending_btn.config(state=tk.DISABLED)
+            self.send_btn.config(state=tk.DISABLED)
+            return
+
+        self.thumbs_count.config(text=f"{fa(count)} عکس")
+        self.clear_pending_btn.config(state=tk.NORMAL)
+        self.send_btn.config(state=tk.NORMAL)
+
+        for i, crop in enumerate(self.pending_crops):
+            cell = tk.Frame(self.thumbs_inner, bg=C_SURFACE)
+            # راست‌به‌چپ مثل بقیه‌ی رابط فارسی
+            cell.pack(side=tk.RIGHT, padx=(14, 0), pady=4)
+
+            photo = self._thumb_photo(crop)
+            self._thumb_imgs.append(photo)
+            thumb = tk.Label(
+                cell, image=photo, bg=C_BG, cursor="hand2",
+                highlightbackground=C_BORDER, highlightthickness=1,
+            )
+            thumb.pack()
+            # کلیک روی بندانگشتی → نمایش بزرگ‌تر در کادر فرم
+            thumb.bind("<Button-1>", lambda e, c=crop: self._show_face_preview(c))
+
+            row = tk.Frame(cell, bg=C_SURFACE)
+            row.pack(fill=tk.X, pady=(3, 0))
+            tk.Label(
+                row, text=f"#{fa(i + 1)}", bg=C_SURFACE, fg=C_MUTED,
+                font=(self.font, 8),
+            ).pack(side=tk.RIGHT)
+            tk.Button(
+                row, text="×", command=lambda idx=i: self._remove_pending(idx),
+                bg="#fee2e2", fg="#dc2626", activebackground="#fecaca",
+                activeforeground="#b91c1c", relief="flat", bd=0, padx=7,
+                cursor="hand2", font=(self.font, 10, "bold"),
+            ).pack(side=tk.LEFT)
+
+        if not self.thumbs_bar.winfo_ismapped():
+            self.thumbs_bar.pack(fill=tk.X, pady=(10, 0))
+
+    def _on_thumbs_configure(self, event=None):
+        """چسباندن نوار بندانگشتی به لبه‌ی راست + به‌روزرسانی ناحیه‌ی اسکرول."""
+        width = self.thumbs_canvas.winfo_width()
+        if width > 1:
+            self.thumbs_canvas.coords(self._thumbs_win, width, 0)
+        bbox = self.thumbs_canvas.bbox("all")
+        if bbox:
+            self.thumbs_canvas.configure(scrollregion=bbox)
+
+    def _on_thumbs_wheel(self, event):
+        """اسکرول افقی نوار بندانگشتی با اسکرول موس."""
+        if not event.delta:
+            return
+        bbox = self.thumbs_canvas.bbox("all")
+        if bbox and bbox[2] > self.thumbs_canvas.winfo_width():
+            self.thumbs_canvas.xview_scroll(-1 * (event.delta // 120), "units")
 
     def _show_face_preview(self, bgr_face):
+        if bgr_face is None or getattr(bgr_face, "size", 0) == 0:
+            self._clear_face_preview()
+            return
         rgb = cv2.cvtColor(bgr_face, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb).resize((160, 160))
+        img = Image.fromarray(rgb).resize((96, 96))
         self._tk_face_img = ImageTk.PhotoImage(image=img)
-        self.face_preview_label.config(image=self._tk_face_img)
+        self.face_preview_label.config(image=self._tk_face_img, text="")
+
+    def _clear_face_preview(self):
+        self.face_preview_label.config(image="", text="بدون چهره")
+
+    # -----------------------------------------------------------------
+    # تب «مدیریت افراد» — مشاهده، ویرایش و حذف رکوردهای ثبت‌شده
+    # -----------------------------------------------------------------
+    def _build_manage_tab(self):
+        """چیدن تب دوم: نوار جستجو، جدول افراد و فرم ویرایش سمت راست."""
+        wrap = tk.Frame(self.manage_tab, bg=C_BG)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
+
+        # --- نوار ابزار بالای تب ---
+        bar = tk.Frame(wrap, bg=C_BG)
+        bar.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(bar, text="جستجو:", bg=C_BG, fg=C_MUTED,
+                 font=(self.font, 9)).pack(side=tk.RIGHT)
+        self.people_search_var = tk.StringVar()
+        ttk.Entry(bar, textvariable=self.people_search_var,
+                  width=30).pack(side=tk.RIGHT, padx=(6, 0))
+        self.people_search_var.trace_add(
+            "write", lambda *_: self._filter_people())
+
+        self.people_count_label = tk.Label(
+            bar, text="", bg=C_PRIMARY_SOFT, fg=C_PRIMARY,
+            font=(self.font, 9, "bold"), padx=8,
+        )
+        self.people_count_label.pack(side=tk.RIGHT, padx=(0, 14))
+
+        ttk.Button(bar, text="بروزرسانی فهرست", command=self.load_people,
+                   style="Primary.TButton").pack(side=tk.LEFT)
+
+        # --- کارت جدول (سمت چپ، قابل گسترش) ---
+        list_card = tk.Frame(wrap, bg=C_SURFACE, highlightbackground=C_BORDER,
+                             highlightthickness=1)
+        list_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 12))
+
+        # ترتیب ستون‌ها از چپ به راست است؛ چون رابط فارسی است «نام» باید
+        # راست‌ترین ستون باشد، پس آخر از همه اضافه می‌شود.
+        cols = ("userwhom", "socialnumber", "role", "gender", "age", "name")
+        self.people_tree = ttk.Treeview(
+            list_card, columns=cols, show="headings", selectmode="browse",
+            style="People.Treeview",
+        )
+        headings = {
+            "name": "نام", "age": "سن", "gender": "جنسیت",
+            "role": "نقش", "socialnumber": "کد ملی", "userwhom": "userwhom",
+        }
+        widths = {
+            "name": 170, "age": 60, "gender": 80,
+            "role": 90, "socialnumber": 130, "userwhom": 120,
+        }
+        for c in cols:
+            self.people_tree.heading(c, text=headings[c], anchor="e")
+            self.people_tree.column(c, width=widths[c], anchor="e",
+                                    stretch=(c == "name"))
+
+        people_sb = ttk.Scrollbar(list_card, orient=tk.VERTICAL,
+                                  command=self.people_tree.yview)
+        self.people_tree.configure(yscrollcommand=people_sb.set)
+        people_sb.pack(side=tk.LEFT, fill=tk.Y)
+        self.people_tree.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        self.people_tree.bind("<<TreeviewSelect>>", self._on_people_select)
+
+        # --- فرم ویرایش (سمت راست، عرض ثابت مثل فرم تب ثبت) ---
+        panel = tk.Frame(wrap, bg=C_SURFACE, width=330,
+                         highlightbackground=C_BORDER, highlightthickness=1)
+        panel.pack(side=tk.RIGHT, fill=tk.Y)
+        panel.pack_propagate(False)
+
+        tk.Label(panel, text="ویرایش فرد", bg=C_SURFACE, fg=C_TEXT,
+                 font=(self.font, 12, "bold")).pack(anchor="e", padx=16,
+                                                     pady=(12, 0))
+        ttk.Separator(panel, orient="horizontal").pack(
+            fill=tk.X, padx=16, pady=(6, 8))
+
+        photo_box = tk.Frame(panel, width=104, height=104, bg=C_BG,
+                             highlightbackground=C_BORDER, highlightthickness=1)
+        photo_box.pack(anchor="e", padx=16, pady=(2, 4))
+        photo_box.pack_propagate(False)
+        self.people_photo_label = tk.Label(
+            photo_box, bg=C_BG, text="بدون تصویر", fg="#94a3b8",
+            font=(self.font, 9),
+        )
+        self.people_photo_label.pack(expand=True, fill=tk.BOTH)
+
+        self.p_name_var = tk.StringVar()
+        self.p_age_var = tk.StringVar()
+        self.p_gender_var = tk.StringVar()
+        self.p_role_var = tk.StringVar()
+        self.p_social_var = tk.StringVar()
+        self.p_userwhom_var = tk.StringVar()
+
+        fields = tk.Frame(panel, bg=C_SURFACE)
+        fields.pack(fill=tk.X, padx=16, pady=(6, 0))
+
+        def label_for(text):
+            tk.Label(fields, text=text, bg=C_SURFACE, fg=C_MUTED,
+                     font=(self.font, 9)).pack(anchor="e", pady=(7, 2))
+
+        label_for("نام")
+        ttk.Entry(fields, textvariable=self.p_name_var).pack(fill=tk.X)
+
+        label_for("سن")
+        ttk.Entry(fields, textvariable=self.p_age_var).pack(fill=tk.X)
+
+        duo = tk.Frame(fields, bg=C_SURFACE)
+        duo.pack(fill=tk.X)
+
+        col_gender = tk.Frame(duo, bg=C_SURFACE)
+        col_gender.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        tk.Label(col_gender, text="جنسیت", bg=C_SURFACE, fg=C_MUTED,
+                 font=(self.font, 9)).pack(anchor="e", pady=(7, 2))
+        ttk.Combobox(col_gender, textvariable=self.p_gender_var,
+                     values=list(GENDER_MAP), state="readonly").pack(fill=tk.X)
+
+        col_role = tk.Frame(duo, bg=C_SURFACE)
+        col_role.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        tk.Label(col_role, text="نقش", bg=C_SURFACE, fg=C_MUTED,
+                 font=(self.font, 9)).pack(anchor="e", pady=(7, 2))
+        ttk.Combobox(col_role, textvariable=self.p_role_var,
+                     values=list(ROLE_MAP), state="readonly").pack(fill=tk.X)
+
+        label_for("کد ملی")
+        ttk.Entry(fields, textvariable=self.p_social_var).pack(
+            fill=tk.X, pady=(0, 2))
+
+        label_for("userwhom")
+        ttk.Entry(fields, textvariable=self.p_userwhom_var).pack(
+            fill=tk.X, pady=(0, 4))
+
+        # --- دکمه‌ها (پایین فرم) ---
+        actions = tk.Frame(panel, bg=C_SURFACE)
+        actions.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=12)
+
+        self.p_save_btn = ttk.Button(
+            actions, text="ذخیره تغییرات", command=self.save_person,
+            state=tk.DISABLED, style="Success.TButton",
+        )
+        self.p_save_btn.pack(fill=tk.X, pady=(0, 6))
+
+        self.p_delete_btn = ttk.Button(
+            actions, text="حذف این فرد", command=self.delete_person,
+            state=tk.DISABLED, style="Danger.TButton",
+        )
+        self.p_delete_btn.pack(fill=tk.X)
+
+    def _on_tab_changed(self, event=None):
+        """بارگذاری فهرست افراد در اولین بار که تب «مدیریت افراد» باز می‌شود."""
+        if not self._people_loaded and self.notebook.index("current") == 1:
+            self._people_loaded = True
+            self.load_people()
+
+    def load_people(self, event=None):
+        """خواندن همه‌ی رکوردهای known_face از PocketBase و پر کردن جدول."""
+        url = f"{POCKETBASE_URL}/api/collections/{COLLECTION}/records"
+        records = []
+        page = 1
+        total_pages = 1
+        try:
+            while page <= total_pages:
+                res = requests.get(
+                    url,
+                    params={"perPage": 200, "page": page, "sort": "name"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                res.raise_for_status()
+                data = res.json()
+                records.extend(data.get("items", []))
+                total_pages = data.get("totalPages", 1)
+                page += 1
+        except Exception as e:
+            messagebox.showerror(
+                "خطا", f"بارگذاری فهرست افراد ناموفق بود:\n{e}")
+            return
+
+        self.people_map = {
+            rec["id"]: rec for rec in records if rec.get("id")
+        }
+        self._filter_people()
+        self._set_status(
+            f"{fa(len(self.people_map))} فرد از پایگاه داده خوانده شد")
+
+    def _people_row(self, rec):
+        """مقادیر نمایشی یک ردیف جدول (به ترتیب ستون‌ها)."""
+        emb = rec.get("embdanings")
+        photos = fa(len(emb) // EMBEDDING_DIM) if isinstance(emb, list) else "—"
+        return (
+            rec.get("userwhom") or "—",
+            rec.get("socialnumber") or "—",
+            ROLE_FA.get(rec.get("role"), "—"),
+            GENDER_FA.get(rec.get("gender"), "—"),
+            fa(rec.get("age") or "—"),
+            rec.get("name") or "—",
+        )
+
+    def _filter_people(self):
+        """بازسازی جدول با فیلتر جستجوی زنده (نام / کد ملی / userwhom)."""
+        if not hasattr(self, "people_tree"):
+            return
+
+        query = self.people_search_var.get().translate(
+            _PERSIAN_DIGITS).strip().lower()
+        self.people_tree.delete(*self.people_tree.get_children())
+
+        shown = 0
+        for rid, rec in self.people_map.items():
+            if query:
+                haystack = " ".join(
+                    str(rec.get(k) or "")
+                    for k in ("name", "socialnumber", "userwhom")
+                )
+                if query not in haystack.translate(_PERSIAN_DIGITS).lower():
+                    continue
+            self.people_tree.insert(
+                "", tk.END, iid=rid, values=self._people_row(rec))
+            shown += 1
+
+        self.people_count_label.config(text=f"{fa(shown)} نفر")
+        if shown == 0:
+            self._reset_people_form()
+        else:
+            self.p_save_btn.config(state=tk.DISABLED)
+            self.p_delete_btn.config(state=tk.DISABLED)
+
+    def _on_people_select(self, event=None):
+        """پر کردن فرم ویرایش از روی ردیف انتخاب‌شده در جدول."""
+        selection = self.people_tree.selection()
+        if not selection:
+            return
+        rec = self.people_map.get(selection[0])
+        if rec is None:
+            return
+
+        self.p_name_var.set(rec.get("name") or "")
+        self.p_age_var.set(str(rec.get("age") or ""))
+        self.p_gender_var.set(GENDER_FA.get(rec.get("gender"), ""))
+        self.p_role_var.set(ROLE_FA.get(rec.get("role"), ""))
+        self.p_social_var.set(rec.get("socialnumber") or "")
+        self.p_userwhom_var.set(rec.get("userwhom") or "")
+
+        self.p_save_btn.config(state=tk.NORMAL)
+        self.p_delete_btn.config(state=tk.NORMAL)
+        self._show_people_photo(rec)
+        self._set_status(
+            f"«{rec.get('name') or '—'}» انتخاب شد — فیلدها قابل ویرایش هستند")
+
+    def _reset_people_form(self):
+        """خالی کردن فرم ویرایش و غیرفعال کردن دکمه‌ها."""
+        for var in (self.p_name_var, self.p_age_var, self.p_gender_var,
+                    self.p_role_var, self.p_social_var, self.p_userwhom_var):
+            var.set("")
+        self.people_photo_label.config(image="", text="بدون تصویر")
+        self._people_photo = None
+        self.p_save_btn.config(state=tk.DISABLED)
+        self.p_delete_btn.config(state=tk.DISABLED)
+
+    def _show_people_photo(self, rec):
+        """نمایش تصویر ذخیره‌شده‌ی رکورد (فیلد image) در کادر فرم."""
+        filename = rec.get("image")
+        if not filename:
+            self.people_photo_label.config(image="", text="بدون تصویر")
+            self._people_photo = None
+            return
+
+        url = (f"{POCKETBASE_URL}/api/files/{COLLECTION_ID}/"
+               f"{rec['id']}/{filename}")
+        try:
+            res = requests.get(url, timeout=REQUEST_TIMEOUT)
+            res.raise_for_status()
+            img = Image.open(io.BytesIO(res.content)).convert("RGB")
+            img = img.resize((96, 96), Image.LANCZOS)
+        except Exception:
+            self.people_photo_label.config(image="", text="تصویر موجود نیست")
+            self._people_photo = None
+            return
+
+        self._people_photo = ImageTk.PhotoImage(image=img)
+        self.people_photo_label.config(image=self._people_photo, text="")
+
+    def save_person(self):
+        """ذخیره‌ی فیلدهای ویرایش‌شده روی رکورد انتخاب‌شده (PATCH)."""
+        selection = self.people_tree.selection()
+        rec = self.people_map.get(selection[0]) if selection else None
+        if rec is None:
+            return
+
+        name = self.p_name_var.get().strip()
+        if not name:
+            messagebox.showwarning("خطا", "وارد کردن نام الزامی است")
+            return
+
+        age_raw = self.p_age_var.get().strip().translate(_PERSIAN_DIGITS)
+        if age_raw and not age_raw.isdigit():
+            messagebox.showwarning("خطا", "سن باید یک عدد صحیح باشد")
+            return
+
+        # همه‌ی فیلدها متنی‌اند، پس مقدار خالی هم قابل ارسال است
+        # (برخلاف append که نباید فیلد خالی را بازنویسی کند).
+        data = {
+            "name": name,
+            "age": age_raw,
+            "gender": GENDER_MAP.get(self.p_gender_var.get().strip(), ""),
+            "role": ROLE_MAP.get(self.p_role_var.get().strip(), ""),
+            "socialnumber": self.p_social_var.get().strip(),
+            "userwhom": self.p_userwhom_var.get().strip(),
+        }
+
+        url = (f"{POCKETBASE_URL}/api/collections/{COLLECTION}"
+               f"/records/{rec['id']}")
+        try:
+            res = requests.patch(url, data=data, timeout=REQUEST_TIMEOUT)
+            res.raise_for_status()
+        except Exception as e:
+            messagebox.showerror("خطا در ذخیره", str(e))
+            return
+
+        # رکورد تازه‌خوانده‌شده را جایگزین می‌کنیم تا جدول و فرم هم‌گام بمانند
+        try:
+            fresh = requests.get(
+                url, params={"fields": "id,name,age,gender,role,"
+                                     "socialnumber,userwhom,image"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            fresh.raise_for_status()
+            self.people_map[rec["id"]] = fresh.json()
+        except Exception:
+            self.people_map[rec["id"]].update(data)
+
+        self._filter_people()
+        # انتخاب را روی همان رکورد نگه می‌داریم تا ویرایش بعدی هم ممکن باشد
+        if rec["id"] in self.people_tree.get_children():
+            self.people_tree.selection_set(rec["id"])
+            self._on_people_select()
+        self._notify_engine_refresh()
+        messagebox.showinfo("موفق", f"تغییرات «{name}» ذخیره شد")
+        self._set_status(f"«{name}» به‌روزرسانی شد")
+
+    def delete_person(self):
+        """حذف کامل رکورد انتخاب‌شده از پایگاه داده (با تأییدیه)."""
+        selection = self.people_tree.selection()
+        rec = self.people_map.get(selection[0]) if selection else None
+        if rec is None:
+            return
+
+        name = rec.get("name") or "—"
+        if not messagebox.askyesno(
+            "تأیید",
+            f"رکورد «{name}» با تمام امبدینگ‌هایش برای همیشه حذف شود؟",
+        ):
+            return
+
+        url = (f"{POCKETBASE_URL}/api/collections/{COLLECTION}"
+               f"/records/{rec['id']}")
+        try:
+            res = requests.delete(url, timeout=REQUEST_TIMEOUT)
+            res.raise_for_status()
+        except Exception as e:
+            messagebox.showerror("خطا در حذف", str(e))
+            return
+
+        self.people_map.pop(rec["id"], None)
+        self._filter_people()
+        self._notify_engine_refresh()
+        messagebox.showinfo("موفق", f"«{name}» حذف شد")
+        self._set_status(f"«{name}» از پایگاه داده حذف شد")
+
+    def _notify_engine_refresh(self):
+        """خبر کردن موتور تشخیص چهره که دیتابیس تغییر کرده است."""
+        try:
+            requests.get(f"http://127.0.0.1:{self.readPort()}/util/refreshDb",
+                         timeout=5)
+        except Exception:
+            # نبودن موتور نباید عملیات را ناموفق جلوه کند
+            pass
 
     # -----------------------------------------------------------------
     # ارسال به PocketBase
     # -----------------------------------------------------------------
     def send_to_db(self):
         if not self.pending_embeddings:
-            messagebox.showwarning("خطا", "حداقل یک چهره باید به لیست اضافه شده باشد")
+            messagebox.showwarning(
+                "خطا", "حداقل یک چهره باید به لیست اضافه شده باشد")
             return
 
-        name = self.name_entry.get().strip()
+        name = self.name_var.get().strip()
         if not name:
             messagebox.showwarning("خطا", "وارد کردن نام الزامی است")
             return
 
-        birth = parse_jalali_date(self.birth_entry.get())
+        birth = parse_jalali_date(self.birth_var.get())
         if birth is None:
             messagebox.showwarning(
                 "خطا", "تاریخ تولد شمسی معتبر وارد کنید (مثال: 1377/04/12)"
@@ -660,11 +1543,15 @@ class EnrollApp:
             messagebox.showwarning("خطا", "تاریخ تولد نمی‌تواند در آینده باشد")
             return
         age = str(age_value)
-        gender = self.gender_combo.get().strip()
-        role_fa = self.role_combo.get().strip()
-        role_map = {"مجاز": "approve", "غیر مجاز": "denied"}
-        role = role_map.get(role_fa, "")
-        social = self.social_entry.get().strip()
+        gender_fa = self.gender_var.get().strip()
+        gender = GENDER_MAP.get(gender_fa, "")
+        role_fa = self.role_var.get().strip()
+        role = ROLE_MAP.get(role_fa, "")
+        social = self.social_var.get().strip()
+        userwhom_fa = self.userwhom_var.get().strip()
+        userwhom_map={"همکار":"colleague","ارباب رجوع":"visitor"}
+        userwhom=userwhom_map.get(userwhom_fa,"")
+
 
         # همه‌ی امبدینگ‌های جمع‌شده (چند عکس) با هم به یک لیست تخت تبدیل می‌شوند —
         # دقیقاً همان قالبی که load_embeddings_from_db در سمت اصلی انتظار دارد
@@ -678,24 +1565,49 @@ class EnrollApp:
         try:
             existing = self._find_existing_record(name)
             if existing:
-                self._append_embedding(existing, embedding_list, age, gender, role, social)
-                messagebox.showinfo("موفق", f"{count} امبدینگ جدید به «{name}» اضافه شد")
+                self._append_embedding(
+                    existing, embedding_list, age, gender, role, social,userwhom)
+                messagebox.showinfo(
+                    "موفق", f"{count} امبدینگ جدید به «{name}» اضافه شد")
             else:
-                self._create_record(name, embedding_list, age, gender, role, social)
+                self._create_record(name, embedding_list,
+                                    age, gender, role, social,userwhom)
                 messagebox.showinfo("موفق", f"«{name}» با {count} عکس ثبت شد")
 
+            self._notify_engine_refresh()
             self._set_status("ارسال با موفقیت انجام شد")
+
+            # ریست کامل فرم: عکس‌های لیست، تصویر freezes و همه‌ی فیلدها
             self.back_to_live()
             self._reset_pending()
-            self.name_entry.delete(0, tk.END)
-            self.birth_entry.delete(0, tk.END)
-            self.age_label.config(text="سن: —")
-            self.role_combo.set("")
-            self.social_entry.delete(0, tk.END)
-            self.gender_combo.set("")
+            self._reset_enroll_form()
 
         except Exception as e:
             messagebox.showerror("خطا در ارسال", str(e))
+
+    def _reset_enroll_form(self):
+        """صفر کردن کامل فرم ثبت: همه‌ی فیلدها، پیش‌نمایش و دکمه‌ها.
+
+        مقادیر از طریق StringVar پاک می‌شوند تا کمبوهای readonly هم
+        واقعاً خالی دیده شوند."""
+        for var in (self.name_var, self.birth_var, self.gender_var,
+                    self.role_var, self.social_var, self.userwhom_var):
+            var.set("")
+        self.age_label.config(text="سن: —")
+        self._clear_face_preview()
+        self.add_btn.config(state=tk.DISABLED)
+        self.live_btn.config(state=tk.DISABLED)
+        self.current_embedding = None
+        self.selected_face_crop = None
+        self._tk_face_img = None
+        # فوکوس از فیلدها برداشته می‌شود تا تایپ تصادفی وارد فرم نشود
+        self.root.focus_set()
+
+    def readPort(self):
+        with open('hostname.json') as file:
+
+            data = json.load(file)
+            return data['port']
 
     def _find_existing_record(self, name):
         url = f"{POCKETBASE_URL}/api/collections/{COLLECTION}/records"
@@ -707,7 +1619,7 @@ class EnrollApp:
         items = res.json().get("items", [])
         return items[0] if items else None
 
-    def _create_record(self, name, embedding_list, age, gender, role, social):
+    def _create_record(self, name, embedding_list, age, gender, role, social,userwhom):
         url = f"{POCKETBASE_URL}/api/collections/{COLLECTION}/records"
         data = {
             "name": name,
@@ -716,12 +1628,14 @@ class EnrollApp:
             "gender": gender,
             "role": role,
             "socialnumber": social,
+            "userwhom":userwhom
         }
         files = self._face_file_payload()
-        res = requests.post(url, data=data, files=files, timeout=REQUEST_TIMEOUT)
+        res = requests.post(url, data=data, files=files,
+                            timeout=REQUEST_TIMEOUT)
         res.raise_for_status()
 
-    def _append_embedding(self, existing_record, new_embedding_list, age, gender, role, social):
+    def _append_embedding(self, existing_record, new_embedding_list, age, gender, role, social,userwhom):
         record_id = existing_record["id"]
         old_embeddings = existing_record.get("embdanings") or []
         if not isinstance(old_embeddings, list):
@@ -739,9 +1653,12 @@ class EnrollApp:
             data["role"] = role
         if social:
             data["socialnumber"] = social
+        if userwhom:
+            data['userwhom']=userwhom
 
         files = self._face_file_payload()
-        res = requests.patch(url, data=data, files=files, timeout=REQUEST_TIMEOUT)
+        res = requests.patch(url, data=data, files=files,
+                             timeout=REQUEST_TIMEOUT)
         res.raise_for_status()
 
     def _face_file_payload(self):

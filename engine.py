@@ -49,7 +49,7 @@ FACE_DETECTION_CONFIDENCE_THRESHOLD = 0.5
 RECOGNITION_UPDATE_INTERVAL = 2  # seconds
 JPEG_QUALITY = 85
 TRACK_TTL = 30
-
+logging.info("10.4.26")
 
 @dataclass(frozen=True)
 class FaceIndex:

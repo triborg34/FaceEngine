@@ -19,3 +19,5 @@ LICENSE.md
 pocketbase.exe
 build/
 oldengines/
+regions.exe
+thisapp.py
